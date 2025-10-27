@@ -139,6 +139,7 @@ class TFTClassifier(nn.Module):
             
             num_classes: int = 20,
             pred_len: int = 5,
+            eta_quantiles: Tuple[float,...] = (0.1, 0.5, 0.9),
             ):
         super().__init__()
         self.pred_len = pred_len
@@ -177,6 +178,10 @@ class TFTClassifier(nn.Module):
 
 
         self.classifier = nn.Linear(d_model, num_classes)
+
+
+        self.eta_quantiles = eta_quantiles
+        self.eta_head = nn.Linear(d_model, len(eta_quantiles)) if len(eta_quantiles) > 0 else None
 
     
     def _make_causal_mask(self, B, T_q, T_k, device):
@@ -245,10 +250,12 @@ class TFTClassifier(nn.Module):
 
         if self.pred_len == 1:
             logits = self.classifier(dec_final[:, -1, :]) 
+            eta_q = self.eta_head(dec_final[:, -1, :]) if self.eta_head is not None else None
         else:
             logits = self.classifier(dec_final)  
+            eta_q = self.eta_head(dec_final) if self.eta_head is not None else None
 
-        return logits, {
+        return (logits, eta_q), {
             "enc_alpha": enc_alpha,      
             "dec_alpha": dec_alpha,       
             "attn_weights": attn_w,       
@@ -257,6 +264,24 @@ class TFTClassifier(nn.Module):
 
 
 NUM_PORTS = 5
+
+
+def pinball_loss(pred_q: torch.Tensor, y: torch.Tensor, quantiles: Tuple[float,...]):
+    """
+    pred_q: [B, T, Q] or [B, Q]
+    y:      [B, T]     or [B]
+    """
+    if pred_q.dim() == 2:  # [B,Q] -> [B,1,Q], [B] -> [B,1]
+        pred_q = pred_q.unsqueeze(1)
+        y = y.unsqueeze(1)
+
+    y = y.unsqueeze(-1).expand_as(pred_q)   # [B,T,Q]
+    e = y - pred_q
+    losses = []
+    for qi, q in enumerate(quantiles):
+        losses.append(torch.max((q-1)*e[..., qi], q*e[..., qi]).mean())
+    return sum(losses) / len(losses)
+
 
 def one_hot(idx: torch.Tensor, num_classes: int) -> torch.Tensor:
     return F.one_hot(idx, num_classes=num_classes).float()
@@ -326,18 +351,37 @@ class FakeAISDataset(Dataset):
         sog = torch.stack(sog, dim=0)                    # (T_enc,1)
         cog = torch.stack(cog, dim=0)                    # (T_enc,1)
 
-        # decoder known-future features for T_dec steps
-        # hour/dow are "known" calendar features; wind is a "forecast"
+
         start_hour = torch.randint(0, 24, (1,)).item()
         hours = (torch.arange(self.T_dec) + start_hour) % 24
         dows  = torch.randint(0, 7, (self.T_dec,))
-        hour_oh = one_hot(hours, 24)                     # (T_dec, 24)
-        dow_oh  = one_hot(dows, 7)                       # (T_dec, 7)
-        wind_fc = torch.randn(self.T_dec, 1) * 0.5 + 5.0 # (T_dec, 1)
+        hour_oh = one_hot(hours, 24)                     
+        dow_oh  = one_hot(dows, 7)                       
+        wind_fc = torch.randn(self.T_dec, 1) * 0.5 + 5.0 
 
-        # labels: sequence of the same destination port across the horizon
-        # (you could make this change mid-horizon if you like)
+
         y = torch.full((self.T_dec,), dest, dtype=torch.long)
+
+        DT_MIN = 5  
+
+        pos_lon, pos_lat = lon[-1].item(), lat[-1].item()
+        steps_to_arrival = 0
+        while True:
+            vec = (dest_xy - torch.tensor([pos_lon, pos_lat]))
+            dx, dy = vec[0].item(), vec[1].item()
+            if (dx*dx + dy*dy) ** 0.5 < 0.02: 
+                break
+            heading = math.atan2(dy, dx)
+            speed = 9.0 
+            pos_lon += math.cos(heading) * 0.01
+            pos_lat += math.sin(heading) * 0.01
+            steps_to_arrival += 1
+
+        tta_minutes = []
+        for k in range(self.T_dec):
+            rem = max(steps_to_arrival - k, 0) * DT_MIN
+            tta_minutes.append(rem)
+        eta = torch.tensor(tta_minutes, dtype=torch.float)  # (T_dec,)
 
         sample = {
             "enc_vars": {
@@ -355,6 +399,7 @@ class FakeAISDataset(Dataset):
             "static_cat": vessel_type,               # (1,)
             "static_cont": torch.cat([loa, gt], -1), # (2,)
             "target": y,                             # (T_dec,)
+            "eta_target": eta, 
         }
         return sample
 
@@ -376,8 +421,9 @@ def collate_batch(batch: List[Dict]):
     static_cat = torch.stack([b["static_cat"] for b in batch], dim=0)        # (B,1)
     static_cont = torch.stack([b["static_cont"] for b in batch], dim=0)      # (B,2)
     targets = torch.stack([b["target"] for b in batch], dim=0)               # (B,T_dec)
+    eta_targets = torch.stack([b["eta_target"] for b in batch], dim=0)  # (B, T_dec)
 
-    return enc_vars, dec_vars, enc_lengths, static_cont, static_cat, targets
+    return enc_vars, dec_vars, enc_lengths, static_cont, static_cat, targets, eta_targets
 
 # -------------------------
 # (C) Wire it together and train
@@ -414,7 +460,7 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
 
     for step, batch in enumerate(dl):
-        enc_vars, dec_vars, enc_lengths, static_cont, static_cat, targets = batch
+        enc_vars, dec_vars, enc_lengths, static_cont, static_cat, targets, eta_targets = batch
         # move to device
         enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
         dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
@@ -424,14 +470,18 @@ def main():
         targets = targets.to(device).long()  # (B,T_dec)
 
         # forward
-        logits, extras = model(enc_vars, dec_vars, enc_lengths, static_cont, static_cat)
+        (logits, eta_q), extras = model(enc_vars, dec_vars, enc_lengths, static_cont, static_cat)
         # logits: (B,T_dec,NUM_CLASSES)
 
         # loss (seq-to-seq cross-entropy)
-        loss = F.cross_entropy(
+        ce = F.cross_entropy(
             logits.reshape(-1, NUM_CLASSES),   # (B*T_dec, C)
             targets.reshape(-1)                 # (B*T_dec,)
         )
+
+        ql = pinball_loss(eta_q, eta_targets.to(device).float(), model.eta_quantiles)
+
+        loss = 0.7 * ce + 0.3 * ql
 
         opt.zero_grad()
         loss.backward()
@@ -448,7 +498,7 @@ def main():
 
     # Example: inspect variable importances from last batch forward
     with torch.no_grad():
-        logits, extras = model(enc_vars, dec_vars, enc_lengths, static_cont, static_cat)
+        (logits, eta_q), extras = model(enc_vars, dec_vars, enc_lengths, static_cont, static_cat)
         print("enc_alpha shape:", extras["enc_alpha"].shape)  # (B,T_enc,V_enc)
         print("dec_alpha shape:", extras["dec_alpha"].shape)  # (B,T_dec,V_dec)
         print("attn weights:", extras["attn_weights"].shape)  # (B,T_dec,T_enc,heads)

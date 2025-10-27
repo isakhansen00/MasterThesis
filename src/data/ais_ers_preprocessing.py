@@ -224,9 +224,18 @@ def get_static_from_ers(ers_df, callsign):
     }
 
 # ---------------- main ----------------
-def match_and_insert(ais_filename: str, ers_filename: str, radio2mmsi_path="data/radio2mmsi.csv"):
+def load_and_concat_ais_files(ais_files):
+    """Load and concatenate multiple AIS files into a single DataFrame."""
+    dfs = []
+    for file in ais_files:
+        print(f"[*] Loading AIS file: {os.path.basename(file)}")
+        df = pd.read_csv(file, delimiter=",")
+        dfs.append(df)
+    return pd.concat(dfs, ignore_index=True)
+
+def match_and_insert(ais_files: list, ers_filename: str, radio2mmsi_path="data/radio2mmsi.csv"):
     print("[*] Loading datasets")
-    ais_df = pd.read_csv(ais_filename, delimiter=",")
+    ais_df = load_and_concat_ais_files(ais_files)
     ers_df = pd.read_csv(ers_filename, delimiter=";")
     radio2mmsi = pd.read_csv(radio2mmsi_path, skiprows=1, delimiter=";", index_col=0).squeeze().to_dict()
     print("[+] Datasets loaded")
@@ -352,8 +361,51 @@ def match_and_insert(ais_filename: str, ers_filename: str, radio2mmsi_path="data
 # ---------------- CLI ----------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Match AIS & ERS and insert into Postgres schema")
-    ap.add_argument("ais", type=str, help="AIS CSV file")
-    ap.add_argument("ers", type=str, help="ERS CSV file")
+    ap.add_argument("base_dir", type=str, help="Base directory (e.g., code/data)")
+    ap.add_argument("year", type=str, help="Year to process (e.g., '2016')")
     ap.add_argument("--radio2mmsi", type=str, default="data/radio2mmsi.csv", help="callsign→MMSI map (CSV ';')")
     args = ap.parse_args()
-    match_and_insert(args.ais, args.ers, args.radio2mmsi)
+
+    # Setup paths
+    base_dir = os.path.abspath(args.base_dir)
+    ais_dir = os.path.join(base_dir, args.year)
+    ers_dir = os.path.join(base_dir, "ers", args.year)
+    
+    # Find AIS files
+    ais_files = []
+    if os.path.exists(ais_dir):
+        for file in os.listdir(ais_dir):
+            if file.endswith('.csv') and file != 'combined.csv':
+                ais_files.append(os.path.join(ais_dir, file))
+    
+    # Find ERS file
+    ers_file = None
+    if os.path.exists(ers_dir):
+        ers_files = [f for f in os.listdir(ers_dir) if f.endswith('.csv')]
+        if ers_files:
+            ers_file = os.path.join(ers_dir, ers_files[0])  # Take the first ERS file found
+
+    # Validate found files
+    if not ais_files:
+        print(f"Error: No AIS files found in {ais_dir}")
+        exit(1)
+    if not ers_file:
+        print(f"Error: No ERS file found in {ers_dir}")
+        exit(1)
+
+    # Sort AIS files to ensure consistent processing order
+    ais_files.sort()
+
+    print(f"\nProcessing data for year {args.year}")
+    print(f"Found {len(ais_files)} AIS files:")
+    for f in ais_files:
+        print(f"  - {os.path.basename(f)}")
+    print(f"ERS file:")
+    print(f"  - {os.path.basename(ers_file)}")
+
+    # Process the files
+    try:
+        match_and_insert(ais_files, ers_file, args.radio2mmsi)
+    except Exception as e:
+        print(f"Error during processing: {str(e)}")
+        exit(1)
