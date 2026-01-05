@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, uuid, argparse
+import os, uuid, argparse, json
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -7,6 +7,7 @@ from collections import Counter
 from bisect import bisect_right
 from pyproj import Geod
 from tqdm import tqdm
+import re
 
 # Optional database imports - only needed for DB mode
 try:
@@ -20,10 +21,17 @@ except ImportError:
 
 """
 AIS-ERS preprocessing + catches:
-- Voyage windows from per-year ERS merged.csv (Stopptidspunkt, Ankomsttidspunkt, Avgangstidspunkt)
-- Static info + gear usage from ERS DCA/POR/DEP (ers/<year>/...)
-- AIS selection/filters; enforce last AIS point ≤ PORT_MAX_KM to a known port
-- NEW: voyage_catches_{year}.csv with aggregated DCA catches per voyage (by species)
+- Voyage windows / AIS track selection now matches the OLD script logic:
+    * starttime = Stopptidspunkt
+    * stoptime  = Ankomsttidspunkt + (Avgangstidspunkt - Ankomsttidspunkt)/2
+    * Filter AIS by MMSI and within (starttime, stoptime)
+    * Gap filter, 20-msg + 4h minimum, port within 5km via 'coords' column
+    * Downsample + normalize
+- On top of that we attach:
+    * Static info from ERS
+    * Gear usage timeline
+    * Catches (DCA) per voyage/species
+    * CSV outputs for vessels/voyages/ais_points/catches
 """
 
 geod = Geod(ellps='WGS84')
@@ -34,8 +42,8 @@ min_sog, max_sog = 0, 30.0
 min_lat, max_lat = 69.2, 73.0
 min_lon, max_lon = 13.0, 31.5
 
-# Require end-of-window to be within N km of a port
-PORT_MAX_KM = 10.0
+# Require end-of-window to be within N km of a port (old script used 5 km)
+PORT_MAX_KM = 5.0
 
 # ---------------- column aliases for ERS ----------------
 ALIASES = {
@@ -46,8 +54,15 @@ ALIASES = {
     "depart_ts":["Avgangstidspunkt", "Avgang", "ETD"],
     "gear":     ["Redskap FAO", "Redskap FDIR", "Redskap", "Gear"],
     # static
-    "length_m":      ["Største lengde", "Fartøylengde", "Lengde", "length_m"],
-    "width_m":       ["Bredde", "width_m"],
+    "length_m": [
+        "Største lengde",   # vessel length in all three files
+        "Fartøylengde",     # also vessel length
+        "length_m",         # fallback if you ever add a cleaned column
+    ],
+    "width_m": [
+        "Bredde",           # vessel width in all three files
+        "width_m",
+    ],
     "draught_m":     ["Dypgående", "Dypgaende", "draught_m"],
     "engine_kw":     ["Motorkraft", "engine_kw"],
     "gross_tonnage": ["Bruttotonnasje 1969", "Bruttotonnasje annen", "GT", "gross_tonnage"],
@@ -66,14 +81,17 @@ GEAR_REPORT_DELAY_MIN = 60  # conservative to avoid leakage
 
 # -------- utils
 def pick_col(df: pd.DataFrame, names):
-    if df is None: return None
+    if df is None:
+        return None
     for n in names:
-        if n in df.columns: return n
+        if n in df.columns:
+            return n
     return None
 
 def haversine_km(lon1, lat1, lon2, lat2):
     lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1; dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
     a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
     return 6371 * 2 * np.arcsin(np.sqrt(a))
 
@@ -82,16 +100,18 @@ def interpolate(t: int, track: np.ndarray):
     before_p = np.nonzero(t >= track[:,TS])[0]
     after_p  = np.nonzero(t <  track[:,TS])[0]
     if (len(before_p) > 0) and (len(after_p) > 0):
-        apos = after_p[0]; bpos = before_p[-1]
+        apos = after_p[0]
+        bpos = before_p[-1]
         dt_full = float(track[apos,TS] - track[bpos,TS])
-        if abs(dt_full) > 2*3600: return None
+        if abs(dt_full) > 2*3600:
+            return None
         dt_interp = float(t - track[bpos,TS])
         try:
             az, _, dist = geod.inv(track[bpos,1], track[bpos,0], track[apos,1], track[apos,0])
             lon_i, lat_i, _ = geod.fwd(track[bpos,1], track[bpos,0], az, dist*(dt_interp/dt_full))
             sog_i  = (track[apos,2]-track[bpos,2])*(dt_interp/dt_full) + track[bpos,2]
             cog_i  = (track[apos,3]-track[bpos,3])*(dt_interp/dt_full) + track[bpos,3]
-        except:
+        except Exception:
             return None
         return np.array([lat_i, lon_i, sog_i, cog_i, t, track[0,5]])
     return None
@@ -101,19 +121,24 @@ def downsample(arr: np.array, minutes: int):
     sampling_track = np.empty((0, 6))
     for t in range(int(arr[0, TS]), int(arr[-1, TS]), minutes*60):
         interpolated = interpolate(t, arr)
-        if interpolated is None: return None
+        if interpolated is None:
+            return None
         sampling_track = np.vstack([sampling_track, interpolated])
     return sampling_track
 
 def filter_outlier_messages(arr: np.ndarray) -> np.ndarray:
     TS = 4
     q = len(arr) // 4
-    first_cut = 0; last_cut = len(arr)
+    first_cut = 0
+    last_cut = len(arr)
     for i in range(1, len(arr)):
         if arr[i][TS] - arr[i-1][TS] > 2*3600:
-            if i <= q: first_cut = i
-            elif i >= 3*q: last_cut = i
-            else: return np.array([])
+            if i <= q:
+                first_cut = i
+            elif i >= 3*q:
+                last_cut = i
+            else:
+                return np.array([])
     return arr[first_cut:last_cut]
 
 def most_common(seq):
@@ -153,13 +178,15 @@ def build_gear_timeline_any(ers_sources, callsign, t_start, t_end, delay_min=GEA
             g = str(r[gear_col]).strip()
             ts = r["ts_eff"].to_pydatetime()
             if not timeline or g != last:
-                timeline.append((ts, g)); last = g
+                timeline.append((ts, g))
+                last = g
         if timeline:
             return timeline
     return []
 
 def stamp_gear_on_grid(grid_ts, timeline):
-    if not grid_ts: return [], [], []
+    if not grid_ts:
+        return [], [], []
     change_ts = [t for t,_ in timeline]
     change_g  = [g for _,g in timeline]
     gear_id=[]; changed=[]; t_since=[]; last_idx=-1; last_change_time=None
@@ -169,12 +196,16 @@ def stamp_gear_on_grid(grid_ts, timeline):
             g = change_g[idx]
             gear_id.append(g)
             if idx != last_idx:
-                changed.append(True); last_idx = idx; last_change_time = max(change_ts[idx], ts)
+                changed.append(True)
+                last_idx = idx
+                last_change_time = max(change_ts[idx], ts)
             else:
                 changed.append(False)
             t_since.append(None if last_change_time is None else int((ts-last_change_time).total_seconds()//60))
         else:
-            gear_id.append(None); changed.append(False); t_since.append(None)
+            gear_id.append(None)
+            changed.append(False)
+            t_since.append(None)
     return gear_id, changed, t_since
 
 # -------- DB helpers
@@ -220,55 +251,117 @@ def load_ports_df(con) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["port_id","name","lat","lon"])
 
 def load_ports_from_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Load ports from CSV.
+
+    Prefers old behaviour:
+      - 'coords' column with JSON "[lat, lon]" -> lat/lon extracted.
+
+    Falls back to wide formats with explicit lat/lon columns.
+    """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Ports CSV not found: {csv_path}")
+
     df = pd.read_csv(csv_path)
+    cols_lower = [c.lower().strip() for c in df.columns]
+
+    # Old behaviour: single "coords" column
+    if "coords" in cols_lower:
+        import ast
+        coords_col = df.columns[cols_lower.index("coords")]
+
+        lats, lons = [], []
+        for v in df[coords_col]:
+            if pd.isna(v):
+                lats.append(np.nan)
+                lons.append(np.nan)
+                continue
+            obj = None
+            try:
+                obj = json.loads(str(v))
+            except Exception:
+                try:
+                    obj = ast.literal_eval(str(v))
+                except Exception:
+                    obj = None
+            if isinstance(obj, (list, tuple)) and len(obj) == 2:
+                try:
+                    lat = float(obj[0])
+                    lon = float(obj[1])
+                except Exception:
+                    lat = lon = np.nan
+            else:
+                lat = lon = np.nan
+            lats.append(lat)
+            lons.append(lon)
+
+        out = pd.DataFrame({"lat": lats, "lon": lons})
+        out = out.dropna(subset=["lat", "lon"])
+        out = out[(out["lat"] != 0) | (out["lon"] != 0)]
+        if out.empty:
+            raise ValueError("Parsed no valid coordinates from 'coords' column.")
+        out["port_id"] = np.arange(1, len(out) + 1, dtype=int)
+        return out[["port_id", "lat", "lon"]]
+
+    # Fallback: wide formats
     df.columns = df.columns.str.lower().str.replace(' ', '_')
+
     column_mapping = {}
     if 'port_id' not in df.columns:
         for col in ['portid', 'id', 'port_number']:
             if col in df.columns:
-                column_mapping[col] = 'port_id'; break
+                column_mapping[col] = 'port_id'
+                break
     if 'name' not in df.columns:
         for col in ['port_name', 'portname']:
             if col in df.columns:
-                column_mapping[col] = 'name'; break
+                column_mapping[col] = 'name'
+                break
     if 'lat' not in df.columns:
         for col in ['latitude', 'lat_dd', 'y']:
             if col in df.columns:
-                column_mapping[col] = 'lat'; break
+                column_mapping[col] = 'lat'
+                break
     if 'lon' not in df.columns:
         for col in ['longitude', 'long', 'lon_dd', 'x']:
             if col in df.columns:
-                column_mapping[col] = 'lon'; break
+                column_mapping[col] = 'lon'
+                break
     if column_mapping:
         df = df.rename(columns=column_mapping)
+
     required = ['port_id', 'lat', 'lon']
-    missing = [col for col in required if col not in df.columns]
+    missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Ports CSV missing required columns: {missing}. Found: {df.columns.tolist()}")
-    before_count = len(df)
+
+    before = len(df)
     df = df.dropna(subset=['lat', 'lon'])
     df = df[(df['lat'] != 0) | (df['lon'] != 0)]
-    after_count = len(df)
-    if before_count > after_count:
-        print(f"[!] Filtered out {before_count - after_count} ports with missing/invalid coordinates")
+    after = len(df)
+    if before > after:
+        print(f"[!] Filtered out {before - after} ports with missing/invalid coordinates")
+
     df['port_id'] = df['port_id'].astype(int)
-    return df[['port_id', 'name', 'lat', 'lon']] if 'name' in df.columns else df[['port_id', 'lat', 'lon']]
+    return df[['port_id', 'lat', 'lon']]
 
 def nearest_port_id(lat, lon, ports_df):
-    if ports_df.empty: return None, None
+    if ports_df.empty:
+        return None, None
     dists = haversine_km(lon, lat, ports_df["lon"].values, ports_df["lat"].values)
     idx = int(np.argmin(dists))
     return int(ports_df.iloc[idx]["port_id"]), float(dists[idx])
 
 # -------- ERS loading
 def load_ers_files(ers_dir, year):
-    dca_df = None; por_df = None; dep_df = None
+    dca_df = None
+    por_df = None
+    dep_df = None
     if not os.path.exists(ers_dir):
         return dca_df, por_df, dep_df
     for filename in os.listdir(ers_dir):
-        if not filename.endswith('.csv'): continue
+        if not filename.endswith('.csv'):
+            continue
         if 'overforingsmelding' in filename.lower() or 'tra' in filename.lower():
             continue
         filepath = os.path.join(ers_dir, filename)
@@ -286,123 +379,85 @@ def load_ers_files(ers_dir, year):
                 df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
     return dca_df, por_df, dep_df
 
-def load_ers_merged(ais_year_dir: str):
-    merged_path = os.path.join(ais_year_dir, "merged.csv")
-    if not os.path.exists(merged_path):
-        return None
-    print(f"[*] Loading ERS merged file: {merged_path}")
-    df = pd.read_csv(merged_path, delimiter=";", low_memory=False)
-    def _parse(ts):
-        return pd.to_datetime(ts, errors="coerce", dayfirst=True)
-    for cols in (ALIASES["stop_ts"], ALIASES["arrive_ts"], ALIASES["depart_ts"]):
-        col = pick_col(df, cols)
-        if col:
-            df[col] = _parse(df[col])
-    return df
-
-def next_event_after(merged_df: pd.DataFrame, callsign: str, ts: pd.Timestamp):
-    call_col = pick_col(merged_df, ALIASES["callsign"])
-    stop_col = pick_col(merged_df, ALIASES["stop_ts"])
-    arr_col  = pick_col(merged_df, ALIASES["arrive_ts"])
-    dep_col  = pick_col(merged_df, ALIASES["depart_ts"])
-    sub = merged_df.loc[merged_df[call_col] == callsign, [stop_col, arr_col, dep_col]].copy()
-    stamps = pd.to_datetime(pd.Series(pd.concat([sub[stop_col], sub[arr_col], sub[dep_col]])), errors="coerce")
-    stamps = stamps[pd.notna(stamps) & (stamps > ts)]
-    return stamps.min() if not stamps.empty else None
-
-def derive_voyage_window_from_row(row, merged_df):
-    call_col = pick_col(merged_df, ALIASES["callsign"])
-    stop_col = pick_col(merged_df, ALIASES["stop_ts"])
-    arr_col  = pick_col(merged_df, ALIASES["arrive_ts"])
-    dep_col  = pick_col(merged_df, ALIASES["depart_ts"])
-    stop_time = row.get(stop_col, None)
-    arr_time  = row.get(arr_col, None)
-    dep_time  = row.get(dep_col, None)
-    if pd.notna(stop_time) and pd.notna(arr_time) and pd.notna(dep_time) and dep_time >= arr_time:
-        end_time = arr_time + (dep_time - arr_time) / 2
-        return stop_time, end_time, arr_time, dep_time
-    if pd.notna(stop_time) and pd.notna(arr_time):
-        return stop_time, arr_time, arr_time, None
-    if pd.notna(stop_time):
-        next_ts = next_event_after(merged_df, row[call_col], stop_time)
-        if next_ts is not None:
-            return stop_time, next_ts, None, None
-        return stop_time, stop_time + pd.Timedelta(days=1), None, None
-    return None, None, None, None
-
 # -------- static info extraction
+def _parse_number(value):
+    """
+    Robust numeric parser for static vessel fields.
+    Handles:
+      - comma decimals: '53,2' -> 53.2
+      - stray units/text: '55 m', '5 200 hk' -> 55, 5200
+    Returns float or np.nan.
+    """
+    if pd.isna(value):
+        return np.nan
+
+    s = str(value).strip()
+    if not s:
+        return np.nan
+
+    # replace comma with dot for decimals
+    s = s.replace(",", ".")
+
+    # keep only characters that look like part of a number
+    # (digits, sign, dot, exponent markers)
+    s = re.sub(r"[^0-9eE\+\-\.]", "", s)
+    if not s:
+        return np.nan
+
+    return pd.to_numeric(s, errors="coerce")
+
+
 def get_static_from_ers(ers_sources, callsign):
     static_info = {
-        "length_m": None, "width_m": None, "draught_m": None,
-        "engine_kw": None, "gross_tonnage": None, "vessel_type": None, "flag": None
+        "length_m": None,
+        "width_m": None,
+        "draught_m": None,
+        "engine_kw": None,
+        "gross_tonnage": None,
+        "vessel_type": None,
+        "flag": None,
     }
     cs = str(callsign).strip().upper()
+
     for df in ers_sources:
-        if df is None or df.empty: continue
+        if df is None or df.empty:
+            continue
+
         call_col = pick_col(df, ALIASES["callsign"])
-        if not call_col: continue
+        if not call_col:
+            continue
+
         sub = df[df[call_col].astype(str).str.strip().str.upper() == cs]
-        if sub.empty: continue
+        if sub.empty:
+            continue
+
         for key in list(static_info.keys()):
-            if static_info[key] is not None: continue
+            # don't overwrite once we have a value
+            if static_info[key] is not None:
+                continue
+
             col = pick_col(sub, ALIASES[key])
-            if not col: continue
+            if not col:
+                continue
+
             for v in sub[col].dropna().iloc[::-1]:
-                if key in ("vessel_type","flag"):
+                if key in ("vessel_type", "flag"):
                     val = str(v).strip()
                     if val:
-                        static_info[key] = val; break
+                        static_info[key] = val
+                        break
                 else:
-                    val = pd.to_numeric(v, errors="coerce")
+                    val = _parse_number(v)
                     if pd.notna(val):
-                        static_info[key] = float(val); break
+                        static_info[key] = float(val)
+                        break
+
     return static_info
-
-# -------- legacy POR/DEP matching (fallback)
-def match_voyage_from_por_dep(por_df, dep_df, callsign, dca_stop_time, time_window_hours=168):
-    call_col_por = pick_col(por_df, ALIASES["callsign"])
-    call_col_dep = pick_col(dep_df, ALIASES["callsign"])
-    arrive_col = pick_col(por_df, ALIASES["arrive_ts"])
-    depart_col = pick_col(dep_df, ALIASES["depart_ts"])
-    if not all([call_col_por, call_col_dep, arrive_col, depart_col]):
-        return None
-    arrivals = por_df.loc[
-        (por_df[call_col_por] == callsign) &
-        (por_df[arrive_col] > dca_stop_time) &
-        (por_df[arrive_col] <= dca_stop_time + pd.Timedelta(hours=time_window_hours))
-    ].sort_values(arrive_col)
-    if arrivals.empty:
-        return None
-    arrival_time = arrivals.iloc[0][arrive_col]
-    departures = dep_df.loc[
-        (dep_df[call_col_dep] == callsign) &
-        (dep_df[depart_col] >= arrival_time)
-    ].sort_values(depart_col)
-    if departures.empty:
-        return None
-    departure_time = departures.iloc[0][depart_col]
-    return arrival_time, departure_time
-
-# -------- AIS helpers
-def load_and_concat_ais_files(ais_files):
-    dfs = []
-    for file in ais_files:
-        if 'merged' in os.path.basename(file).lower():
-            continue
-        df = pd.read_csv(file, delimiter=",", low_memory=False)
-        dfs.append(df)
-    return pd.concat(dfs, ignore_index=True)
-
-def index_ais_by_mmsi(ais_df):
-    ais_grouped = {}
-    for mmsi, group in ais_df.groupby('mmsi'):
-        ais_grouped[mmsi] = group.sort_values('date').copy()
-    return ais_grouped
 
 # -------- catches from DCA within a voyage window
 def extract_voyage_catches(dca_df: pd.DataFrame, callsign: str, t_start: datetime, t_end: datetime) -> pd.DataFrame:
     """Return aggregated catches per species for callsign within [t_start, t_end] using DCA."""
-    if dca_df is None or dca_df.empty: 
+    if dca_df is None or dca_df.empty:
         return pd.DataFrame(columns=[
             "art_fao_code","art_fao","art_fdir_code","art_fdir","total_rundvekt_kg"
         ])
@@ -435,11 +490,15 @@ def extract_voyage_catches(dca_df: pd.DataFrame, callsign: str, t_start: datetim
 
     # Grouping keys (prefer FAO; include FDIR too when present)
     group_keys = []
-    if fao_code_col: group_keys.append(fao_code_col)
-    if fao_name_col: group_keys.append(fao_name_col)
-    if fdir_code_col: group_keys.append(fdir_code_col)
-    if fdir_name_col: group_keys.append(fdir_name_col)
-    if not group_keys:  # if no species columns found, aggregate as single bucket
+    if fao_code_col:
+        group_keys.append(fao_code_col)
+    if fao_name_col:
+        group_keys.append(fao_name_col)
+    if fdir_code_col:
+        group_keys.append(fdir_code_col)
+    if fdir_name_col:
+        group_keys.append(fdir_name_col)
+    if not group_keys:
         sub = sub.assign(_w=w)
         tot = float(sub["_w"].sum())
         return pd.DataFrame([{
@@ -453,7 +512,6 @@ def extract_voyage_catches(dca_df: pd.DataFrame, callsign: str, t_start: datetim
               .sum()
               .reset_index(name="total_rundvekt_kg"))
 
-    # Normalize column names in output
     out = pd.DataFrame({
         "art_fao_code": agg.get(fao_code_col, pd.Series([None]*len(agg))),
         "art_fao": agg.get(fao_name_col, pd.Series([None]*len(agg))),
@@ -478,174 +536,310 @@ def count_por_after_label(por_df: pd.DataFrame, callsign: str, label_ts: datetim
     ]
     return int(len(sub))
 
-# -------- main processing
-def match_and_insert(ais_files: list, ers_dir: str, year: str, radio2mmsi_path="data/radio2mmsi.csv",
-                     output_mode="csv", csv_output_dir="output", ports_csv_path="data/ports.csv", limit=None):
+# -------- legacy-style port helper (matches old script)
+def close_to_port_legacy(arr: np.ndarray, ports_df: pd.DataFrame):
+    """
+    Old-script style port matching:
+      - ports_df must have a 'coords' column with JSON like "[lat, lon]".
+      - Uses the last AIS message in `arr`.
+    Returns: (in_port_flag, distance_km, (port_lat, port_lon), row_index)
+    """
+    last_msg = arr[-1]
+    lat = float(last_msg[0])
+    lon = float(last_msg[1])
+
+    closest_dist = float("inf")
+    closest_port = None
+    closest_idx = None
+
+    for idx, row in ports_df.reset_index(drop=True).iterrows():
+        try:
+            port_lat, port_lon = tuple(json.loads(row["coords"]))
+        except Exception:
+            continue
+        dist = haversine_km(lon, lat, port_lon, port_lat)
+        if dist < closest_dist:
+            closest_dist = dist
+            closest_port = (port_lat, port_lon)
+            closest_idx = idx
+
+    if closest_port is not None and closest_dist < 5.0:
+        return True, closest_dist, closest_port, closest_idx
+    return False, None, None, None
+
+# -------- legacy-style AIS–ERS matching (core selection like old script)
+def generate_voyages_like_old_script(
+    ais_files,
+    ers_csv_path,
+    radio2mmsi_path,
+    ports_csv_path,
+    limit=None,
+):
+    """
+    Reproduce the old script's AIS–ERS matching behaviour as closely as possible.
+    Returns:
+      - tracks: list of dicts with normalized traj + metadata
+      - counters: dict with instrumentation counts
+    """
+    print("[*] Loading datasets (legacy-compatible)")
+
+    # --- AIS (exactly like old script) ---
+    ais_dfs = []
+    for i, ais_file in enumerate(ais_files, 1):
+        df = pd.read_csv(ais_file, delimiter=",", low_memory=False)
+        ais_dfs.append(df)
+        print(f"[+] Loaded AIS file {i}/{len(ais_files)}: {ais_file}")
+    ais_df = pd.concat(ais_dfs, ignore_index=True)
+    print(f"[+] Combined AIS Dataset: {len(ais_df)} messages")
+
+    # Old script used strict format
+    ais_df["date"] = pd.to_datetime(
+        ais_df["date"],
+        format="%Y-%m-%dT%H:%M:%S",
+        errors="coerce",
+    )
+
+    # --- ERS merged.csv (legacy-style) ---
+    if not os.path.exists(ers_csv_path):
+        raise FileNotFoundError(f"ERS merged file not found: {ers_csv_path}")
+    ers_df = pd.read_csv(ers_csv_path, delimiter=";", low_memory=False)
+    print("[+] Loaded ERS merged.csv")
+
+    # Parse timestamps like old script
+    for col_name in ["Stopptidspunkt", "Ankomsttidspunkt", "Avgangstidspunkt"]:
+        if col_name in ers_df.columns:
+            ers_df[col_name] = pd.to_datetime(
+                ers_df[col_name],
+                format="%Y-%m-%d %H:%M:%S",
+                errors="coerce",
+            )
+
+    if limit is not None:
+        print(f"[!] LIMIT: Processing only first {limit} ERS rows (legacy loop)")
+        ers_df = ers_df.head(limit)
+
+    # --- Radio2MMSI & ports (old-style) ---
+    radio2mmsi = pd.read_csv(
+        radio2mmsi_path,
+        skiprows=1,
+        delimiter=";",
+        index_col=0,
+    ).squeeze().to_dict()
+    print("[+] Loaded Radio2MMSI")
+
+    ports_raw = pd.read_csv(ports_csv_path, delimiter=",", low_memory=False)
+    if "coords" not in ports_raw.columns:
+        raise ValueError("Expected 'coords' column in ports.csv to match old script.")
+    print("[+] Loaded Ports (raw coords)")
+
+    # --- Instrumentation counters ---
+    counters = {
+        "n_total": len(ers_df),
+        "n_window_ok": 0,
+        "n_has_mmsi": 0,
+        "n_has_ais": 0,
+        "n_quality_ok": 0,
+        "n_downsample_ok": 0,
+        "n_port_ok": 0,
+    }
+
+    tracks = []
+
+    # --- Core legacy loop ---
+    for _, row in tqdm(ers_df.iterrows(), desc="Collecting AIS tracks (legacy)", total=len(ers_df.index)):
+        starttime = row["Stopptidspunkt"]
+        arr_time  = row["Ankomsttidspunkt"]
+        dep_time  = row["Avgangstidspunkt"]
+
+        # Require all three timestamps and dep >= arr
+        if pd.isna(starttime) or pd.isna(arr_time) or pd.isna(dep_time) or dep_time < arr_time:
+            continue
+
+        stoptime = arr_time + (dep_time - arr_time) / 2.0
+        counters["n_window_ok"] += 1
+
+        # Callsign / MMSI mapping: use exact old column name if present
+        if "Radiokallesignal (ERS)" in ers_df.columns:
+            callsign = row["Radiokallesignal (ERS)"]
+        else:
+            call_col = pick_col(ers_df, ALIASES["callsign"])
+            callsign = row[call_col] if call_col else None
+
+        if pd.isna(callsign):
+            continue
+
+        mmsi = radio2mmsi.get(callsign, 0)
+        if not mmsi:
+            continue
+        counters["n_has_mmsi"] += 1
+
+        # AIS in window (exactly like old script)
+        df_ais = ais_df.loc[ais_df["mmsi"] == mmsi].copy()
+        df_ais = df_ais.loc[(df_ais["date"] > starttime) & (df_ais["date"] < stoptime)]
+        if df_ais.empty:
+            continue
+        counters["n_has_ais"] += 1
+
+        df_ais["timestamp"] = df_ais["date"].astype(np.int64) // 10**9
+        df_ais = df_ais.loc[:, ["lat", "long", "sog", "cog", "timestamp", "mmsi"]]
+        arr = df_ais.to_numpy()
+
+        # Gap filtering
+        arr = filter_outlier_messages(arr)
+        if len(arr) == 0:
+            continue
+
+        # Length & duration filters (20 messages, 4 hours)
+        duration = datetime.fromtimestamp(arr[-1][4]) - datetime.fromtimestamp(arr[0][4])
+        if len(arr) < 20 or duration < timedelta(hours=4):
+            continue
+        counters["n_quality_ok"] += 1
+
+        # Save last RAW AIS point
+        last_raw_lat = float(arr[-1][0])
+        last_raw_lon = float(arr[-1][1])
+        last_raw_ts  = int(arr[-1][4])
+
+        # Port filter (old behaviour, 5 km, using coords JSON)
+        in_port, dist2port, port_coords, port_idx = close_to_port_legacy(arr, ports_raw)
+        if not in_port:
+            continue
+        counters["n_port_ok"] += 1
+
+        # Downsample after port filter (like old script)
+        arr_ds = downsample(arr, minutes=5)
+        if arr_ds is None or len(arr_ds) == 0:
+            continue
+        counters["n_downsample_ok"] += 1
+
+        # Normalize (min-max) exactly as before
+        arr_ds[:, 0] = (arr_ds[:, 0].astype(np.float32) - min_lat) / (max_lat - min_lat)
+        arr_ds[:, 1] = (arr_ds[:, 1].astype(np.float32) - min_lon) / (max_lon - min_lon)
+        arr_ds[:, 2] = (arr_ds[:, 2].astype(np.float32) - min_sog) / (max_sog - min_sog)
+        arr_ds[:, 3] = (arr_ds[:, 3].astype(np.float32) - min_cog) / (max_cog - min_cog)
+        arr_ds[:, :4][arr_ds[:, :4] >= 1] = 0.9999
+
+        label_ts = datetime.fromtimestamp(last_raw_ts)
+
+        tracks.append({
+            "mmsi": int(mmsi),
+            "callsign": callsign,
+            "start_time": starttime.to_pydatetime(),
+            "end_time": stoptime.to_pydatetime(),
+            "label_ts": label_ts,
+            "label_lat": last_raw_lat,
+            "label_lon": last_raw_lon,
+            "port_distance_km": float(dist2port),
+            "port_lat": float(port_coords[0]),
+            "port_lon": float(port_coords[1]),
+            "port_idx": int(port_idx),
+            "traj": arr_ds,
+        })
+
+    return tracks, counters
+
+# -------- main processing (now built on legacy-style selection)
+def match_and_insert(ais_files, ers_dir, year,
+                     radio2mmsi_path="data/radio2mmsi.csv",
+                     output_mode="csv", csv_output_dir="output",
+                     ports_csv_path="data/ports.csv", limit=None):
     print("[*] Loading datasets")
+
+    # ERS merged.csv path (same as old script ers argument)
     year_dir = os.path.dirname(ais_files[0]) if ais_files else None
-    merged_df = load_ers_merged(year_dir) if year_dir else None
+    if not year_dir:
+        raise ValueError("Could not determine year_dir from AIS files")
+    ers_csv_path = os.path.join(year_dir, "merged.csv")
+    if not os.path.exists(ers_csv_path):
+        raise FileNotFoundError(f"ERS merged file not found: {ers_csv_path}")
 
     # Always load original ERS files for static/gear + catches + POR counting
     dca_static, por_static, dep_static = load_ers_files(ers_dir, year)
 
-    # Voyage driver
-    if merged_df is not None:
-        driver_df = merged_df.copy()
-        print("[+] Using ERS merged.csv for voyage windows")
-    else:
-        driver_df = dca_static
-        print("[+] Using legacy ERS DCA for voyage windows")
-
-    ais_df = load_and_concat_ais_files(ais_files)
-    radio2mmsi = pd.read_csv(radio2mmsi_path, skiprows=1, delimiter=";", index_col=0).squeeze().to_dict()
-    print("[+] Datasets loaded")
-
-    if driver_df is None:
-        raise ValueError("No ERS data found - required for voyage processing")
-
-    # AIS filter to year
-    ais_df["date"] = pd.to_datetime(ais_df["date"], errors="coerce")
-    year_start = pd.Timestamp(f"{year}-01-01")
-    year_end = pd.Timestamp(f"{int(year)+1}-01-01")
-    ais_df = ais_df[(ais_df["date"] >= year_start) & (ais_df["date"] < year_end)].copy()
-
-    ais_by_mmsi = index_ais_by_mmsi(ais_df)
-
-    call_col = pick_col(driver_df, ALIASES["callsign"])
-    stop_col = pick_col(driver_df, ALIASES["stop_ts"])
-    if call_col is None or stop_col is None:
-        raise ValueError("ERS data missing required columns (callsign/Stopptidspunkt)")
-
-    if limit is not None:
-        print(f"[!] LIMIT: Processing only first {limit} ERS rows (test mode)")
-        driver_df = driver_df.head(limit)
+    # Use legacy-style voyage generation
+    tracks, counters = generate_voyages_like_old_script(
+        ais_files=ais_files,
+        ers_csv_path=ers_csv_path,
+        radio2mmsi_path=radio2mmsi_path,
+        ports_csv_path=ports_csv_path,
+        limit=limit,
+    )
 
     static_cache = {}
-    total_por_after_label = 0
 
     if output_mode == "csv":
         os.makedirs(csv_output_dir, exist_ok=True)
         vessels_list, voyages_list, gear_events_list, ais_points_list, catches_list = [], [], [], [], []
-        ports_df = load_ports_from_csv(ports_csv_path)
         print(f"[*] CSV output mode - will save to {csv_output_dir}/")
-        print(f"[*] Loaded {len(ports_df)} ports from {ports_csv_path}")
     else:
         if not PSYCOPG_AVAILABLE:
             raise ImportError("Database mode requires psycopg or use --output csv")
         con = connect_env()
-        ports_df = load_ports_df(con)
+        ports_df_db = load_ports_df(con)
+        vessels_list = voyages_list = gear_events_list = ais_points_list = catches_list = None  # placeholder
 
-    for _, ers_row in tqdm(driver_df.iterrows(), total=len(driver_df.index), desc="Processing voyages"):
-        callsign = ers_row[call_col]
-        if pd.isna(callsign):
-            continue
+    # Simple port_id scheme: 1 + port_idx from legacy matching
+    for tr in tqdm(tracks, desc="Enriching voyages (static/gear/catches)"):
+        mmsi = tr["mmsi"]
+        callsign = tr["callsign"]
+        start_time = tr["start_time"]
+        end_time = tr["end_time"]
+        label_ts = tr["label_ts"]
+        label_lat = tr["label_lat"]
+        label_lon = tr["label_lon"]
+        port_distance = tr["port_distance_km"]
+        port_id = tr["port_idx"] + 1
+        arr_ds = tr["traj"]
 
-        # Time window
-        if merged_df is not None:
-            start_time, end_time, arrival_time, departure_time = derive_voyage_window_from_row(ers_row, merged_df)
-        else:
-            stop_time = ers_row[stop_col]
-            if pd.isna(stop_time): continue
-            arrival_time = departure_time = None
-            if por_static is not None and dep_static is not None:
-                match = match_voyage_from_por_dep(por_static, dep_static, callsign, stop_time)
-                if match:
-                    arrival_time, departure_time = match
-            if pd.notna(arrival_time) and pd.notna(departure_time):
-                start_time, end_time = stop_time, arrival_time + (departure_time - arrival_time)/2
-            elif pd.notna(arrival_time):
-                start_time, end_time = stop_time, arrival_time
-            else:
-                start_time, end_time = stop_time, stop_time + pd.Timedelta(days=1)
-
-        if start_time is None or end_time is None or end_time <= start_time:
-            continue
-
-        # MMSI mapping
-        mmsi = radio2mmsi.get(callsign, 0)
-        if not mmsi or mmsi not in ais_by_mmsi:
-            continue
-
-        # AIS in window
-        df = ais_by_mmsi[mmsi]
-        df = df.loc[(df["date"] > start_time) & (df["date"] < end_time)].copy()
-        if df.empty:
-            continue
-
-        df["timestamp"] = df["date"].astype(np.int64) // 10**9
-        df = df.loc[:, ["lat", "long", "sog", "cog", "timestamp", "mmsi"]]
-        arr = df.to_numpy()
-
-        # quality
-        arr = filter_outlier_messages(arr)
-        if len(arr) == 0:
-            continue
-        if len(arr) < 20 or (datetime.fromtimestamp(arr[-1][-2]) - datetime.fromtimestamp(arr[0][-2]) < timedelta(hours=4)):
-            continue
-
-        # interpolate
-        arr_ds = downsample(arr, minutes=5)
-        if arr_ds is None or len(arr_ds) == 0:
-            continue
-
-        # normalize (for storage consistency)
-        arr_ds[:,0] = (arr_ds[:,0].astype(np.float32) - min_lat)/(max_lat - min_lat)
-        arr_ds[:,1] = (arr_ds[:,1].astype(np.float32) - min_lon)/(max_lon - min_lon)
-        arr_ds[:,2] = (arr_ds[:,2].astype(np.float32) - min_sog)/(max_sog - min_sog)
-        arr_ds[:,3] = (arr_ds[:,3].astype(np.float32) - min_cog)/(max_cog - min_cog)
-        arr_ds[:, :4][arr_ds[:, :4] >= 1] = 0.9999
-
-        # nearest port from last point
-        last_norm = arr_ds[-1]
-        lat_real = float(last_norm[0]*(max_lat-min_lat) + min_lat)
-        lon_real = float(last_norm[1]*(max_lon-min_lon) + min_lon)
-        label_port_id, port_distance = (None, None)
-        if not ports_df.empty:
-            label_port_id, port_distance = nearest_port_id(lat_real, lon_real, ports_df)
-        if PORT_MAX_KM is not None and (port_distance is None or port_distance > PORT_MAX_KM):
-            continue
-
-        label_ts = datetime.fromtimestamp(int(arr_ds[-1][4]))
-
-        # static, gear
+        # Static info
         if callsign not in static_cache:
-            static_cache[callsign] = get_static_from_ers([dca_static, por_static, dep_static], callsign)
+            static_cache[callsign] = get_static_from_ers(
+                [por_static, dep_static, dca_static],
+                callsign
+            )
         static_info = static_cache[callsign]
 
-        timeline = build_gear_timeline_any([dca_static, por_static, dep_static], callsign, start_time, end_time)
-        gear_primary = most_common([g for _,g in timeline]) if timeline else None
-        n_changes = max(0, len(timeline)-1)
+        # Gear timeline + summary
+        timeline = build_gear_timeline_any(
+            [dca_static, por_static, dep_static],
+            callsign,
+            start_time,
+            end_time,
+        )
+        gear_primary = most_common([g for _, g in timeline]) if timeline else None
+        n_changes = max(0, len(timeline) - 1)
 
-        # POR arrivals after label ts
+        # POR arrivals after label_ts
         por_after_label_count = count_por_after_label(por_static, callsign, label_ts)
-        total_por_after_label += por_after_label_count
 
-        # CATCHES from DCA within window
+        # Catches from DCA within window
         catches_df = extract_voyage_catches(dca_static, callsign, start_time, end_time)
         total_catch_kg = float(catches_df["total_rundvekt_kg"].sum()) if not catches_df.empty else 0.0
         primary_species = None
         if not catches_df.empty:
             top = catches_df.sort_values("total_rundvekt_kg", ascending=False).iloc[0]
-            primary_species = (top.get("art_fao") or top.get("art_fdir") or top.get("art_fao_code") or top.get("art_fdir_code"))
+            primary_species = (
+                top.get("art_fao")
+                or top.get("art_fdir")
+                or top.get("art_fao_code")
+                or top.get("art_fdir_code")
+            )
 
         voyage_id = str(uuid.uuid4())
 
-        # ------ OUTPUTS (CSV default)
-        # vessels
-        vessel_row = {
-            "mmsi": int(mmsi),
-            "callsign": callsign,
-            "vessel_type": static_info.get("vessel_type"),
-            "flag": static_info.get("flag"),
-            "length_m": static_info.get("length_m"),
-            "width_m": static_info.get("width_m"),
-            "draught_m": static_info.get("draught_m"),
-            "engine_kw": static_info.get("engine_kw"),
-            "gross_tonnage": static_info.get("gross_tonnage")
-        }
         if output_mode == "csv":
-            if "vessels_list" not in locals():
-                vessels_list, voyages_list, gear_events_list, ais_points_list, catches_list = [], [], [], [], []
+            # vessels
+            vessel_row = {
+                "mmsi": int(mmsi),
+                "callsign": callsign,
+                "vessel_type": static_info.get("vessel_type"),
+                "flag": static_info.get("flag"),
+                "length_m": static_info.get("length_m"),
+                "width_m": static_info.get("width_m"),
+                "draught_m": static_info.get("draught_m"),
+                "engine_kw": static_info.get("engine_kw"),
+                "gross_tonnage": static_info.get("gross_tonnage"),
+            }
             if not any(v["mmsi"] == int(mmsi) for v in vessels_list):
                 vessels_list.append(vessel_row)
 
@@ -654,45 +848,52 @@ def match_and_insert(ais_files: list, ers_dir: str, year: str, radio2mmsi_path="
                 "voyage_id": voyage_id,
                 "mmsi": int(mmsi),
                 "callsign": callsign,
-                "start_ts": start_time.to_pydatetime(),
-                "end_ts": end_time.to_pydatetime(),
-                "label_port_id": label_port_id,
+                "start_ts": start_time,
+                "end_ts": end_time,
+                "label_port_id": port_id,
                 "label_ts": label_ts,
-                "label_lat": lat_real,
-                "label_lon": lon_real,
+                "label_lat": label_lat,
+                "label_lon": label_lon,
                 "port_distance_km": port_distance,
                 "gear_primary": gear_primary,
                 "n_changes": n_changes,
                 "n_ais_points": len(arr_ds),
                 "por_after_label_count": por_after_label_count,
                 "total_catch_kg": total_catch_kg,
-                "primary_species": primary_species
+                "primary_species": primary_species,
             })
 
             # gear_events
             for t, g in timeline:
-                gear_events_list.append({"voyage_id": voyage_id, "ts": t, "gear_code": g})
+                gear_events_list.append({
+                    "voyage_id": voyage_id,
+                    "ts": t,
+                    "gear_code": g,
+                })
 
-            # ais_points
-            grid_ts = [datetime.fromtimestamp(int(ts)) for ts in arr_ds[:,4]]
+            # AIS points (denormalize lat/lon/sog/cog for CSV)
+            grid_ts = [datetime.fromtimestamp(int(ts)) for ts in arr_ds[:, 4]]
             gear_id, changed, t_since = stamp_gear_on_grid(grid_ts, timeline)
             for idx in range(len(grid_ts)):
-                lat = float(arr_ds[idx,0]*(max_lat-min_lat) + min_lat)
-                lon = float(arr_ds[idx,1]*(max_lon-min_lon) + min_lon)
-                sog = float(arr_ds[idx,2]*(max_sog-min_sog) + min_sog)
-                cog = float(arr_ds[idx,3]*(max_cog-min_cog) + min_cog)
+                lat = float(arr_ds[idx, 0] * (max_lat - min_lat) + min_lat)
+                lon = float(arr_ds[idx, 1] * (max_lon - min_lon) + min_lon)
+                sog = float(arr_ds[idx, 2] * (max_sog - min_sog) + min_sog)
+                cog = float(arr_ds[idx, 3] * (max_cog - min_cog) + min_cog)
                 ais_points_list.append({
                     "voyage_id": voyage_id,
                     "seq_idx": idx,
                     "ts": grid_ts[idx],
-                    "lat": lat, "lon": lon, "sog": sog, "cog": cog,
+                    "lat": lat,
+                    "lon": lon,
+                    "sog": sog,
+                    "cog": cog,
                     "heading": None,
                     "gear_id": gear_id[idx],
                     "gear_changed_flag": changed[idx],
-                    "time_since_change_min": t_since[idx]
+                    "time_since_change_min": t_since[idx],
                 })
 
-            # catches (one row per species)
+            # catches table
             if not catches_df.empty:
                 for _, r in catches_df.iterrows():
                     catches_list.append({
@@ -702,7 +903,7 @@ def match_and_insert(ais_files: list, ers_dir: str, year: str, radio2mmsi_path="
                         "art_fao": r.get("art_fao"),
                         "art_fdir_code": r.get("art_fdir_code"),
                         "art_fdir": r.get("art_fdir"),
-                        "total_rundvekt_kg": float(r.get("total_rundvekt_kg", 0.0))
+                        "total_rundvekt_kg": float(r.get("total_rundvekt_kg", 0.0)),
                     })
 
     # -------- Save CSVs
@@ -716,6 +917,17 @@ def match_and_insert(ais_files: list, ers_dir: str, year: str, radio2mmsi_path="
         print(f"[+] Wrote CSVs to {csv_output_dir}/ (incl. voyage_catches_{year}.csv)")
     else:
         print("[!] DB mode not extended to insert catches table in this script (export CSV instead).")
+
+    # --- instrumentation summary (using legacy counters) ---
+    print("\n[Instrumentation summary]")
+    print(f"  Total ERS rows (driver_df): {counters['n_total']}")
+    print(f"  With valid time window:     {counters['n_window_ok']}")
+    print(f"  With MMSI match:           {counters['n_has_mmsi']}")
+    print(f"  With AIS in window:        {counters['n_has_ais']}")
+    print(f"  Pass quality (len/dur):    {counters['n_quality_ok']}")
+    print(f"  Pass downsample:           {counters['n_downsample_ok']}")
+    print(f"  Pass port filter:          {counters['n_port_ok']}")
+    print(f"  Final voyages written:     {len(voyages_list) if output_mode=='csv' else 'N/A (DB mode)'}")
 
 # -------- CLI
 if __name__ == "__main__":
