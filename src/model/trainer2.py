@@ -1,27 +1,33 @@
 """
-Train your custom TFTClassifier to predict destination port from AIS voyages.
+Train sequence + static models to predict destination port from AIS voyages.
 
 Assumes preprocessed CSVs per year in --data-dir:
 
     ais_points_YYYY.csv
     voyages_YYYY.csv
     vessels_YYYY.csv
+    voyage_catches_YYYY.csv   (optional, adds catch-based static features)
 
-Usage example:
+Supports three model types:
 
-    python src/model/train_tft_ports.py \
-        --data-dir output --years 2016 2017 2018 \
-        --encoder-length 64 \
-        --hide-last-hours 3 \
-        --encoder-window-mode tail \
-        --batch-size 64 \
-        --epochs 30 \
-        --remove-statics mmsi
+    --model-type tft          : TFTClassifier (your existing model)
+    --model-type bilstm       : BiLSTM + static features (ModelA_BiLSTMWithStatic)
+    --model-type transformer  : Transformer encoder + static features (ModelB_TransformerWithStatic)
+
+Usage example (TFT):
+
+    python src/model/train_ports.py --data-dir output --years 2016 2017 2018 --encoder-length 64 --hide-last-hours 3 --encoder-window-mode tail --batch-size 64 --epochs 30 --remove-statics mmsi --model-type tft
+
+Usage example (BiLSTM baseline):
+
+    python src/model/train_ports.py --data-dir output --years 2016 2017 2018 --encoder-length 64 --hide-last-hours 3 --encoder-window-mode tail --batch-size 64 --epochs 30 --model-type bilstm
 """
 
 import os
 import argparse
 from typing import List, Dict, Tuple, Optional
+import time
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -29,7 +35,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from model import TFTClassifier  # your custom TFT implementation
+# Assumes you define these three in separate files
+from model import TFTClassifier
+from transformer import ModelB_TransformerWithStatic
+from LSTMandStatics import ModelA_BiLSTMWithStatic
 
 
 # ---------- constants: same region as preprocessing ----------
@@ -41,8 +50,23 @@ MIN_COG, MAX_COG = 0.0, 360.0
 AIS_STEP_MINUTES = 5  # 5-minute steps in your preprocessing
 
 # master static feature names; we will filter these based on CLI
-MASTER_STATIC_CONT_FEATURES = ["length_m", "draught_m", "engine_kw", "gross_tonnage"]
-MASTER_STATIC_CAT_FEATURES  = ["gear", "mmsi"]  # gear + vessel identity
+# continuous statics (from voyages + catches)
+MASTER_STATIC_CONT_FEATURES = [
+    "length_m",
+    "draught_m",
+    "engine_kw",
+    "gross_tonnage",
+    "total_catch_kg",    # from voyages_YYYY.csv (already there in your preprocessing)
+    "catch_num_species", # from voyage_catches (aggregated)
+    "catch_entropy",     # from voyage_catches (aggregated)
+]
+# categorical statics
+MASTER_STATIC_CAT_FEATURES = [
+    "gear",
+    "mmsi",
+    "season",
+    "primary_species",   # from voyage_catches or voyages (top species)
+]
 
 
 # ---------- data loading / merging ----------
@@ -90,6 +114,145 @@ def load_all_years(data_dir: str, years: List[int]) -> Tuple[pd.DataFrame, pd.Da
     return ais_df, voyages_df, vessels_df
 
 
+def add_season_and_catch_features(
+    data_dir: str,
+    years: List[int],
+    voyages_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """
+    - Adds a 'season' categorical column to voyages_df based on start_ts (or label_ts).
+    - Reads voyage_catches_YYYY.csv for the requested years (if present) and aggregates:
+        * catch_num_species   (per voyage)
+        * catch_entropy       (Shannon entropy over species composition)
+        * primary_species     (species with max total_rundvekt_kg; FAO name where possible)
+    - Merges these catch-based features into voyages_df on voyage_id.
+    Returns (voyages_df_enriched, catches_df_all_or_None).
+    """
+
+    voyages_df = voyages_df.copy()
+
+    # ---- season from start_ts (fallback to label_ts) ----
+    def _season_from_ts(ts: pd.Timestamp) -> str:
+        if pd.isna(ts):
+            return "Unknown"
+        m = ts.month
+        # Your spec:
+        # • Winter: Jan – March, plus April
+        # • Spring: May – June
+        # • Summer: July – August
+        # • Autumn: The rest
+        if m in (1, 2, 3, 4):
+            return "Winter"
+        elif m in (5, 6):
+            return "Spring"
+        elif m in (7, 8):
+            return "Summer"
+        else:
+            return "Autumn"
+
+    if "start_ts" in voyages_df.columns:
+        ts_col = voyages_df["start_ts"].where(voyages_df["start_ts"].notna(), voyages_df.get("label_ts"))
+    else:
+        ts_col = voyages_df.get("label_ts")
+
+    voyages_df["season"] = ts_col.apply(_season_from_ts)
+
+    # ---- aggregate voyage_catches_YYYY.csv ----
+    all_catches = []
+    for y in years:
+        y_str = str(y)
+        path = os.path.join(data_dir, f"voyage_catches_{y_str}.csv")
+        if os.path.exists(path):
+            print(f"[INFO] Loading catches from {path}")
+            c = pd.read_csv(path)
+            all_catches.append(c)
+        else:
+            print(f"[INFO] No voyage_catches file found for year {y_str} (path={path})")
+
+    if not all_catches:
+        print("[INFO] No voyage_catches_YYYY.csv files found – catch-based features will be zero / Unknown.")
+        voyages_df["catch_num_species"] = np.nan
+        voyages_df["catch_entropy"] = np.nan
+        # keep any existing primary_species, otherwise fill later
+        return voyages_df, None
+
+    catches_df = pd.concat(all_catches, ignore_index=True)
+
+    # ensure columns exist
+    if "voyage_id" not in catches_df.columns or "total_rundvekt_kg" not in catches_df.columns:
+        print("[WARN] voyage_catches files missing 'voyage_id' or 'total_rundvekt_kg'; skipping catch-based features.")
+        voyages_df["catch_num_species"] = np.nan
+        voyages_df["catch_entropy"] = np.nan
+        return voyages_df, catches_df
+
+    catches_df["total_rundvekt_kg"] = pd.to_numeric(
+        catches_df["total_rundvekt_kg"], errors="coerce"
+    ).fillna(0.0)
+
+    # num species per voyage (using FAO code)
+    num_species = (
+        catches_df.groupby("voyage_id")["art_fao_code"]
+        .nunique()
+        .reset_index(name="catch_num_species")
+    )
+
+    # entropy per voyage
+    def _shannon_entropy(group: pd.DataFrame) -> float:
+        w = group["total_rundvekt_kg"].to_numpy(dtype=float)
+        tot = w.sum()
+        if tot <= 0.0:
+            return 0.0
+        p = w / tot
+        return float(-np.sum(p * np.log(p + 1e-12)))
+
+    entropy = (
+        catches_df.groupby("voyage_id")
+        .apply(_shannon_entropy)
+        .reset_index(name="catch_entropy")
+    )
+
+    # primary species per voyage (by total weight)
+    # prefer Art FAO (name), fall back to FAO code or FDIR
+    def _primary_species_per_group(group: pd.DataFrame) -> str:
+        # species-level aggregation
+        agg = (
+            group.groupby(["art_fao_code", "art_fao", "art_fdir_code", "art_fdir"], dropna=False)["total_rundvekt_kg"]
+            .sum()
+            .reset_index()
+        )
+        if agg.empty:
+            return "Unknown"
+        top = agg.sort_values("total_rundvekt_kg", ascending=False).iloc[0]
+        for col in ["art_fao", "art_fdir", "art_fao_code", "art_fdir_code"]:
+            val = top.get(col)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return "Unknown"
+
+    primary_species = (
+        catches_df.groupby("voyage_id")
+        .apply(_primary_species_per_group)
+        .reset_index(name="primary_species_from_catches")
+    )
+
+    # merge all on voyage_id
+    voyages_df = voyages_df.merge(num_species, on="voyage_id", how="left")
+    voyages_df = voyages_df.merge(entropy, on="voyage_id", how="left")
+    voyages_df = voyages_df.merge(primary_species, on="voyage_id", how="left")
+
+    # if voyages already has "primary_species", keep it; else use from catches
+    if "primary_species" not in voyages_df.columns:
+        voyages_df["primary_species"] = voyages_df["primary_species_from_catches"]
+    else:
+        # fill missing primary_species from catches where available
+        mask = voyages_df["primary_species"].isna() | (voyages_df["primary_species"].astype(str).str.len() == 0)
+        voyages_df.loc[mask, "primary_species"] = voyages_df.loc[mask, "primary_species_from_catches"]
+
+    voyages_df.drop(columns=[c for c in ["primary_species_from_catches"] if c in voyages_df.columns], inplace=True)
+
+    return voyages_df, catches_df
+
+
 # ---------- dataset ----------
 
 class VoyagePortDataset(Dataset):
@@ -101,8 +264,8 @@ class VoyagePortDataset(Dataset):
           taken from the **observed part** of the track (last N hours can be hidden).
 
     Static inputs:
-        - continuous: subset of [length_m, draught_m, engine_kw, gross_tonnage]
-        - categorical: subset of [gear_primary, mmsi]
+        - continuous: subset of MASTER_STATIC_CONT_FEATURES
+        - categorical: subset of MASTER_STATIC_CAT_FEATURES
 
     Target:
         - destination port class (0 .. num_ports-1)
@@ -117,6 +280,8 @@ class VoyagePortDataset(Dataset):
         port_id_to_idx: Dict[int, int],
         gear_to_idx: Dict[str, int],
         mmsi_to_idx: Dict[str, int],
+        season_to_idx: Dict[str, int],
+        species_to_idx: Dict[str, int],
         static_cont_features: List[str],
         static_cat_features: List[str],
         hide_last_n_points: int = 0,
@@ -138,6 +303,8 @@ class VoyagePortDataset(Dataset):
         self.port_id_to_idx = port_id_to_idx
         self.gear_to_idx = gear_to_idx
         self.mmsi_to_idx = mmsi_to_idx
+        self.season_to_idx = season_to_idx
+        self.species_to_idx = species_to_idx
         self.static_cont_features = static_cont_features
         self.static_cat_features = static_cat_features
         self.hide_last_n_points = hide_last_n_points
@@ -201,7 +368,7 @@ class VoyagePortDataset(Dataset):
 
         window_mode == "head":
             - use FIRST encoder_length points from the observed part
-            - pad at the END if the sequence is shorter.
+            - pad at the END if shorter.
         """
         if self.window_mode == "tail":
             # use LAST encoder_length points
@@ -274,31 +441,40 @@ class VoyagePortDataset(Dataset):
 
         enc_vars, enc_len = self._normalize_track(df_traj_obs)
 
-        # Decoder input: single dummy time step
+        # Decoder input: single dummy time step (only used by TFT)
         T_dec = 1
         dec_vars = {
             "dec_time": torch.zeros(T_dec, 1, dtype=torch.float32)
         }
 
-        # Static continuous: subset of [length_m, draught_m, engine_kw, gross_tonnage]
+        # Static continuous
         static_cont_vals = []
         for c in self.static_cont_features:
             val = row.get(c, np.nan)
             static_cont_vals.append(0.0 if pd.isna(val) else float(val))
         static_cont = torch.tensor(static_cont_vals, dtype=torch.float32)  # (n_cont,)
 
-        # Static categorical: subset of [gear_primary, mmsi]
-        static_cat_vals = []
-
-        if "gear" in self.static_cat_features:
-            gear = str(row.get("gear_primary", "Unknown"))
-            gear_idx = self.gear_to_idx.get(gear, self.gear_to_idx["Unknown"])
-            static_cat_vals.append(gear_idx)
-
-        if "mmsi" in self.static_cat_features:
-            mmsi_str = str(row.get("mmsi", "Unknown"))
-            mmsi_idx = self.mmsi_to_idx.get(mmsi_str, self.mmsi_to_idx["Unknown"])
-            static_cat_vals.append(mmsi_idx)
+        # Static categorical
+        static_cat_vals: List[int] = []
+        for feat in self.static_cat_features:
+            if feat == "gear":
+                gear = str(row.get("gear_primary", "Unknown"))
+                gear_idx = self.gear_to_idx.get(gear, self.gear_to_idx["Unknown"])
+                static_cat_vals.append(gear_idx)
+            elif feat == "mmsi":
+                mmsi_str = str(row.get("mmsi", "Unknown"))
+                mmsi_idx = self.mmsi_to_idx.get(mmsi_str, self.mmsi_to_idx["Unknown"])
+                static_cat_vals.append(mmsi_idx)
+            elif feat == "season":
+                season_str = str(row.get("season", "Unknown"))
+                season_idx = self.season_to_idx.get(season_str, self.season_to_idx["Unknown"])
+                static_cat_vals.append(season_idx)
+            elif feat == "primary_species":
+                species_str = str(row.get("primary_species", "Unknown"))
+                species_idx = self.species_to_idx.get(species_str, self.species_to_idx["Unknown"])
+                static_cat_vals.append(species_idx)
+            else:
+                raise ValueError(f"Unknown static categorical feature: {feat}")
 
         static_cat = torch.tensor(static_cat_vals, dtype=torch.long)  # (n_cat,)
 
@@ -347,7 +523,7 @@ def collate_batch(batch):
 
 # ---------- evaluation helper ----------
 
-def evaluate_model(model, loader, device):
+def evaluate_model(model, loader, device, model_type: str):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -356,6 +532,7 @@ def evaluate_model(model, loader, device):
     with torch.no_grad():
         for batch in loader:
             enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
+
             enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
             dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
             enc_lens = enc_lens.to(device)
@@ -363,14 +540,27 @@ def evaluate_model(model, loader, device):
             static_cat = static_cat.to(device)
             targets = targets.to(device)
 
-            (logits, eta_q), extras = model(
-                enc_vars=enc_vars,
-                dec_vars=dec_vars,
-                enc_lengths=enc_lens,
-                static_cont=static_cont,
-                static_cat=static_cat,
-            )
-            logits = logits.squeeze(1)
+            if model_type == "tft":
+                (logits, eta_q), extras = model(
+                    enc_vars=enc_vars,
+                    dec_vars=dec_vars,
+                    enc_lengths=enc_lens,
+                    static_cont=static_cont,
+                    static_cat=static_cat,
+                )
+                logits = logits.squeeze(1)  # (B, num_ports)
+            else:
+                # Build (B, T, 4) from encoder vars
+                x_seq = torch.cat(
+                    [enc_vars["lat"], enc_vars["lon"], enc_vars["sog"], enc_vars["cog"]],
+                    dim=-1,
+                )  # (B, T, 4)
+                logits = model(
+                    x_seq=x_seq,
+                    static_cont=static_cont,
+                    static_cat=static_cat,
+                )  # (B, num_ports)
+
             loss = F.cross_entropy(logits, targets)
 
             total_loss += loss.item() * targets.size(0)
@@ -390,14 +580,20 @@ def inspect_one_test_sample(
     idx_to_port_id,
     idx_to_gear,
     idx_to_mmsi,
+    idx_to_season,
+    idx_to_species,
+    static_cat_features: List[str],
     enc_feature_names=("lat", "lon", "sog", "cog"),
     top_k=5,
+    model_type: str = "tft",
 ):
     """
     Take one batch from test_loader, inspect the first sample:
       - print some of the encoder inputs
-      - print static features (length, GT, gear, mmsi)
+      - print static features (continuous vector + decoded categorical)
       - print top-k predicted ports with probabilities
+
+    Works for all model types; TFT-specific extras are ignored here.
     """
     model.eval()
     batch = next(iter(test_loader))
@@ -405,31 +601,41 @@ def inspect_one_test_sample(
     enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
 
     # Move to device
-    enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
-    dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
-    enc_lens = enc_lens.to(device)
-    static_cont = static_cont.to(device)
-    static_cat = static_cat.to(device)
-    targets = targets.to(device)
+    enc_vars_dev = {k: v.to(device) for k, v in enc_vars.items()}
+    dec_vars_dev = {k: v.to(device) for k, v in dec_vars.items()}
+    enc_lens_dev = enc_lens.to(device)
+    static_cont_dev = static_cont.to(device)
+    static_cat_dev = static_cat.to(device)
+    targets_dev = targets.to(device)
 
     with torch.no_grad():
-        (logits, eta_q), extras = model(
-            enc_vars=enc_vars,
-            dec_vars=dec_vars,
-            enc_lengths=enc_lens,
-            static_cont=static_cont,
-            static_cat=static_cat,
-        )
+        if model_type == "tft":
+            (logits, eta_q), extras = model(
+                enc_vars=enc_vars_dev,
+                dec_vars=dec_vars_dev,
+                enc_lengths=enc_lens_dev,
+                static_cont=static_cont_dev,
+                static_cat=static_cat_dev,
+            )
+            logits = logits.squeeze(1)
+        else:
+            x_seq = torch.cat(
+                [enc_vars_dev["lat"], enc_vars_dev["lon"], enc_vars_dev["sog"], enc_vars_dev["cog"]],
+                dim=-1,
+            )
+            logits = model(
+                x_seq=x_seq,
+                static_cont=static_cont_dev,
+                static_cat=static_cat_dev,
+            )
 
-        # logits: (B, 1, num_ports)
-        logits = logits.squeeze(1)  # (B, num_ports)
         probs = torch.softmax(logits, dim=-1)  # (B, num_ports)
 
     # Inspect only first sample in this batch
     b = 0
 
     sample_probs = probs[b].cpu().numpy()
-    true_idx = targets[b].item()
+    true_idx = targets_dev[b].item()
     true_port_id = idx_to_port_id[true_idx]
 
     print("\n=== Inspecting one test sample ===")
@@ -443,23 +649,26 @@ def inspect_one_test_sample(
         print(f"  {feat}: {series[-5:]}")  # last 5 values
 
     # ----- static continuous features -----
-    # STATIC_CONT_FEATURES = ["length_m", "draught_m", "engine_kw", "gross_tonnage"]
-    length_m, draught_m, engine_kw, gross_tonnage = static_cont[b].cpu().numpy().tolist()
-    print("\nStatic continuous:")
-    print(f"  length_m:      {length_m:.2f}")
-    print(f"  draught_m:     {draught_m:.2f}")
-    print(f"  engine_kw:     {engine_kw:.2f}")
-    print(f"  gross_tonnage: {gross_tonnage:.2f}")
+    sc = static_cont[b].cpu().numpy().tolist()
+    print("\nStatic continuous (raw vector):")
+    for i, v in enumerate(sc):
+        print(f"  cont[{i}]: {v:.3f}")
 
-    # ----- static categorical (gear, mmsi) -----
-    gear_idx = static_cat[b, 0].item()
-    mmsi_idx = static_cat[b, 1].item()
-    gear_str = idx_to_gear.get(gear_idx, f"<unknown-{gear_idx}>")
-    mmsi_str = idx_to_mmsi.get(mmsi_idx, f"<unknown-{mmsi_idx}>")
-
-    print("\nStatic categorical:")
-    print(f"  gear: {gear_str} (idx={gear_idx})")
-    print(f"  mmsi: {mmsi_str} (idx={mmsi_idx})")
+    # ----- static categorical -----
+    print("\nStatic categorical (decoded):")
+    for j, feat in enumerate(static_cat_features):
+        idx = static_cat[b, j].item()
+        if feat == "gear":
+            label = idx_to_gear.get(idx, f"<gear-idx-{idx}>")
+        elif feat == "mmsi":
+            label = idx_to_mmsi.get(idx, f"<mmsi-idx-{idx}>")
+        elif feat == "season":
+            label = idx_to_season.get(idx, f"<season-idx-{idx}>")
+        elif feat == "primary_species":
+            label = idx_to_species.get(idx, f"<species-idx-{idx}>")
+        else:
+            label = f"<{feat}-idx-{idx}>"
+        print(f"  {feat}: {label} (idx={idx})")
 
     # ----- top-k predicted ports -----
     top_k = min(top_k, sample_probs.shape[0])
@@ -476,7 +685,7 @@ def inspect_one_test_sample(
 # ---------- main ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train custom TFT to predict destination port with partial tracks")
+    parser = argparse.ArgumentParser(description="Train models to predict destination port with partial tracks")
     parser.add_argument("--data-dir", type=str, default="output")
     parser.add_argument("--years", type=int, nargs="+", default=[2016, 2017, 2018])
     parser.add_argument("--encoder-length", type=int, default=64)
@@ -505,14 +714,32 @@ def main():
         default=[],
         help=(
             "Static features to drop from training/testing. "
-            "Allowed: length_m, draught_m, engine_kw, gross_tonnage, gear, mmsi"
+            "Allowed: "
+            "length_m, draught_m, engine_kw, gross_tonnage, total_catch_kg, "
+            "catch_num_species, catch_entropy, "
+            "gear, mmsi, season, primary_species"
         ),
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["tft", "bilstm", "transformer"],
+        default="tft",
+        help="Which model architecture to train.",
     )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sweep-hide-hours",
+        action="store_true",
+        help="After training, evaluate test accuracy for multiple hide_last_hours values and plot accuracy vs hours.",
+    )
+    parser.add_argument("--sweep-hide-start", type=float, default=3.0)
+    parser.add_argument("--sweep-hide-end", type=float, default=5.0)
+    parser.add_argument("--sweep-hide-step", type=float, default=0.5)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -520,11 +747,15 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] Using device: {device}")
+    print(f"[INFO] Model type: {args.model_type}")
 
     print(f"[INFO] Loading data from {args.data_dir} for years {args.years}")
     ais_df, voyages_df, vessels_df = load_all_years(args.data_dir, args.years)
 
-    # ---- port / gear / mmsi mappings ----
+    # ---- add season + catch-based static features from voyage_catches ----
+    voyages_df, catches_df = add_season_and_catch_features(args.data_dir, args.years, voyages_df)
+
+    # ---- port / gear / mmsi / season / species mappings ----
     unique_port_ids = sorted(voyages_df["label_port_id"].dropna().astype(int).unique().tolist())
     port_id_to_idx = {pid: i for i, pid in enumerate(unique_port_ids)}
     num_ports = len(port_id_to_idx)
@@ -540,9 +771,25 @@ def main():
     mmsi_to_idx = {m: i for i, m in enumerate(mmsi_values)}
     print(f"[INFO] Number of MMSI categories: {len(mmsi_values)}")
 
+    season_values = voyages_df["season"].astype(str).fillna("Unknown")
+    season_values = list(sorted(set(season_values.tolist() + ["Unknown"])))
+    season_to_idx = {s: i for i, s in enumerate(season_values)}
+    print(f"[INFO] Number of seasons: {len(season_values)}")
+
+    species_col = voyages_df.get("primary_species")
+    if species_col is None:
+        species_values = ["Unknown"]
+    else:
+        species_values = species_col.astype(str).fillna("Unknown").tolist()
+        species_values = list(sorted(set(species_values + ["Unknown"])))
+    species_to_idx = {s: i for i, s in enumerate(species_values)}
+    print(f"[INFO] Number of primary_species categories: {len(species_values)}")
+
     idx_to_port_id = {idx: pid for pid, idx in port_id_to_idx.items()}
     idx_to_gear = {idx: g for g, idx in gear_to_idx.items()}
     idx_to_mmsi = {idx: m for m, idx in mmsi_to_idx.items()}
+    idx_to_season = {idx: s for s, idx in season_to_idx.items()}
+    idx_to_species = {idx: s for s, idx in species_to_idx.items()}
 
     # ---- choose static features based on CLI ----
     remove_set = set(args.remove_statics or [])
@@ -591,6 +838,8 @@ def main():
         port_id_to_idx=port_id_to_idx,
         gear_to_idx=gear_to_idx,
         mmsi_to_idx=mmsi_to_idx,
+        season_to_idx=season_to_idx,
+        species_to_idx=species_to_idx,
         static_cont_features=static_cont_features,
         static_cat_features=static_cat_features,
         hide_last_n_points=hide_last_n_points,
@@ -643,23 +892,54 @@ def main():
             static_cat_cardinalities.append(len(gear_to_idx))
         elif f == "mmsi":
             static_cat_cardinalities.append(len(mmsi_to_idx))
+        elif f == "season":
+            static_cat_cardinalities.append(len(season_to_idx))
+        elif f == "primary_species":
+            static_cat_cardinalities.append(len(species_to_idx))
         else:
             raise ValueError(f"Unknown categorical static feature: {f}")
 
-    model = TFTClassifier(
-        enc_var_dims=enc_var_dims,
-        dec_var_dims=dec_var_dims,
-        static_cont_dim=len(static_cont_features),
-        static_cat_cardinalities=static_cat_cardinalities,
-        static_cat_emb_dim=16,
-        d_model=64,
-        lstm_layers=1,
-        dropout=0.1,
-        num_heads=4,
-        num_classes=num_ports,
-        pred_len=1,
-        eta_quantiles=(),
-    ).to(device)
+    if args.model_type == "tft":
+        model = TFTClassifier(
+            enc_var_dims=enc_var_dims,
+            dec_var_dims=dec_var_dims,
+            static_cont_dim=len(static_cont_features),
+            static_cat_cardinalities=static_cat_cardinalities,
+            static_cat_emb_dim=16,
+            d_model=64,
+            lstm_layers=1,
+            dropout=0.1,
+            num_heads=4,
+            num_classes=num_ports,
+            pred_len=1,
+            eta_quantiles=(),
+        ).to(device)
+    elif args.model_type == "bilstm":
+        model = ModelA_BiLSTMWithStatic(
+            ts_input_dim=4,  # lat/lon/sog/cog
+            static_cont_dim=len(static_cont_features),
+            static_cat_cardinalities=static_cat_cardinalities,
+            num_classes=num_ports,
+            hidden_size=64,
+            num_layers=1,
+            dropout=0.1,
+            static_emb_dim=16,
+        ).to(device)
+    elif args.model_type == "transformer":
+        model = ModelB_TransformerWithStatic(
+            ts_input_dim=4,
+            static_cont_dim=len(static_cont_features),
+            static_cat_cardinalities=static_cat_cardinalities,
+            num_classes=num_ports,
+            d_model=64,
+            static_emb_dim=16,
+            n_heads=4,
+            num_layers=2,
+            dim_feedforward=128,
+            dropout=0.1,
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -676,6 +956,7 @@ def main():
 
         for batch in train_loader:
             enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
+
             enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
             dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
             enc_lens = enc_lens.to(device)
@@ -683,14 +964,26 @@ def main():
             static_cat = static_cat.to(device)
             targets = targets.to(device)
 
-            (logits, eta_q), extras = model(
-                enc_vars=enc_vars,
-                dec_vars=dec_vars,
-                enc_lengths=enc_lens,
-                static_cont=static_cont,
-                static_cat=static_cat,
-            )
-            logits = logits.squeeze(1)
+            if args.model_type == "tft":
+                (logits, eta_q), extras = model(
+                    enc_vars=enc_vars,
+                    dec_vars=dec_vars,
+                    enc_lengths=enc_lens,
+                    static_cont=static_cont,
+                    static_cat=static_cat,
+                )
+                logits = logits.squeeze(1)
+            else:
+                x_seq = torch.cat(
+                    [enc_vars["lat"], enc_vars["lon"], enc_vars["sog"], enc_vars["cog"]],
+                    dim=-1,
+                )
+                logits = model(
+                    x_seq=x_seq,
+                    static_cont=static_cont,
+                    static_cat=static_cat,
+                )
+
             loss = F.cross_entropy(logits, targets)
 
             optimizer.zero_grad()
@@ -705,7 +998,7 @@ def main():
         train_loss = total_loss / max(total_cnt, 1)
         train_acc = total_correct / max(total_cnt, 1)
 
-        val_loss, val_acc = evaluate_model(model, val_loader, device)
+        val_loss, val_acc = evaluate_model(model, val_loader, device, args.model_type)
 
         print(
             f"[Epoch {epoch:02d}] "
@@ -722,103 +1015,274 @@ def main():
         model.load_state_dict(best_state)
         print(f"[INFO] Loaded best model (val_acc={best_val_acc:.3f}) for final test evaluation.")
 
-    test_loss, test_acc = evaluate_model(model, test_loader, device)
+    test_loss, test_acc = evaluate_model(model, test_loader, device, args.model_type)
     print(f"[TEST] loss={test_loss:.4f}  acc={test_acc:.3f}")
 
-    # ---------- feature importance on ENCODER variables ----------
-    model.eval()
-    enc_alpha_sum = None
-    n_enc_batches = 0
-    enc_feature_names = list(enc_var_dims.keys())  # ["lat","lon","sog","cog"]
+    # ---------- feature importance (only for TFT) ----------
+    if args.model_type == "tft":
+        model.eval()
+        enc_alpha_sum = None
+        n_enc_batches = 0
+        enc_feature_names = list(enc_var_dims.keys())  # ["lat","lon","sog","cog"]
 
-    with torch.no_grad():
-        for batch in test_loader:
-            enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
-            enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
-            dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
-            enc_lens = enc_lens.to(device)
-            static_cont = static_cont.to(device)
-            static_cat = static_cat.to(device)
+        with torch.no_grad():
+            for batch in test_loader:
+                enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
+                enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
+                dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
+                enc_lens = enc_lens.to(device)
+                static_cont = static_cont.to(device)
+                static_cat = static_cat.to(device)
 
-            (_, _), extras = model(
-                enc_vars=enc_vars,
-                dec_vars=dec_vars,
-                enc_lengths=enc_lens,
-                static_cont=static_cont,
-                static_cat=static_cat,
-            )
+                (_, _), extras = model(
+                    enc_vars=enc_vars,
+                    dec_vars=dec_vars,
+                    enc_lengths=enc_lens,
+                    static_cont=static_cont,
+                    static_cat=static_cat,
+                )
 
-            enc_alpha = extras.get("enc_alpha", None)
-            if enc_alpha is None:
-                continue
-            # enc_alpha: (B, T_enc, V_enc) -> mean over batch and time
-            batch_mean = enc_alpha.mean(dim=(0, 1))  # (V_enc,)
-            if enc_alpha_sum is None:
-                enc_alpha_sum = batch_mean
-            else:
-                enc_alpha_sum += batch_mean
-            n_enc_batches += 1
+                enc_alpha = extras.get("enc_alpha", None)
+                if enc_alpha is None:
+                    continue
+                # enc_alpha: (B, T_enc, V_enc) -> mean over batch and time
+                batch_mean = enc_alpha.mean(dim=(0, 1))  # (V_enc,)
+                if enc_alpha_sum is None:
+                    enc_alpha_sum = batch_mean
+                else:
+                    enc_alpha_sum += batch_mean
+                n_enc_batches += 1
 
-    if enc_alpha_sum is not None and n_enc_batches > 0:
-        enc_alpha_mean = enc_alpha_sum / n_enc_batches
-        print("\n[Feature importance] Encoder variables (test-set average):")
-        for name, score in zip(enc_feature_names, enc_alpha_mean.cpu().numpy()):
-            print(f"   {name}: {score:.4f}")
+        if enc_alpha_sum is not None and n_enc_batches > 0:
+            enc_alpha_mean = enc_alpha_sum / n_enc_batches
+            print("\n[Feature importance] Encoder variables (test-set average):")
+            for name, score in zip(enc_feature_names, enc_alpha_mean.cpu().numpy()):
+                print(f"   {name}: {score:.4f}")
+        else:
+            print("\n[Feature importance] Encoder variables: enc_alpha not found in extras (check TFTClassifier).")
+
+        # ---------- feature importance on STATIC variables ----------
+        static_alpha_sum = None
+        n_static_batches = 0
+        ordered_static_names = static_cont_features + static_cat_features
+
+        with torch.no_grad():
+            for batch in test_loader:
+                enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
+                enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
+                dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
+                enc_lens = enc_lens.to(device)
+                static_cont = static_cont.to(device)
+                static_cat = static_cat.to(device)
+
+                (_, _), extras = model(
+                    enc_vars=enc_vars,
+                    dec_vars=dec_vars,
+                    enc_lengths=enc_lens,
+                    static_cont=static_cont,
+                    static_cat=static_cat,
+                )
+
+                static_alpha = extras.get("static_alpha", None)
+                if static_alpha is None:
+                    continue
+                # static_alpha: (B, V_static) -> mean over batch
+                batch_mean = static_alpha.mean(dim=0)  # (V_static,)
+                if static_alpha_sum is None:
+                    static_alpha_sum = batch_mean
+                else:
+                    static_alpha_sum += batch_mean
+                n_static_batches += 1
+
+        if static_alpha_sum is not None and n_static_batches > 0 and len(ordered_static_names) > 0:
+            static_alpha_mean = static_alpha_sum / n_static_batches
+            print("\n[Feature importance] STATIC variables (test-set average):")
+            for name, score in zip(ordered_static_names, static_alpha_mean.cpu().numpy()):
+                print(f"   {name}: {score:.4f}")
+        else:
+            print("\n[Feature importance] STATIC variables: either none in use or static_alpha not found in extras.")
     else:
-        print("\n[Feature importance] Encoder variables: enc_alpha not found in extras (check TFTClassifier).")
+        print("\n[Feature importance] Skipped: only implemented for TFT (model_type='tft').")
 
-    # ---------- feature importance on STATIC variables ----------
-    static_alpha_sum = None
-    n_static_batches = 0
-    ordered_static_names = static_cont_features + static_cat_features
-
-    with torch.no_grad():
-        for batch in test_loader:
-            enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, eta_targets = batch
-            enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
-            dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
-            enc_lens = enc_lens.to(device)
-            static_cont = static_cont.to(device)
-            static_cat = static_cat.to(device)
-
-            (_, _), extras = model(
-                enc_vars=enc_vars,
-                dec_vars=dec_vars,
-                enc_lengths=enc_lens,
-                static_cont=static_cont,
-                static_cat=static_cat,
-            )
-
-            static_alpha = extras.get("static_alpha", None)
-            if static_alpha is None:
-                continue
-            # static_alpha: (B, V_static) -> mean over batch
-            batch_mean = static_alpha.mean(dim=0)  # (V_static,)
-            if static_alpha_sum is None:
-                static_alpha_sum = batch_mean
-            else:
-                static_alpha_sum += batch_mean
-            n_static_batches += 1
-
-    if static_alpha_sum is not None and n_static_batches > 0 and len(ordered_static_names) > 0:
-        static_alpha_mean = static_alpha_sum / n_static_batches
-        print("\n[Feature importance] STATIC variables (test-set average):")
-        for name, score in zip(ordered_static_names, static_alpha_mean.cpu().numpy()):
-            print(f"   {name}: {score:.4f}")
-    else:
-        print("\n[Feature importance] STATIC variables: either none in use or static_alpha not found in extras.")
-        
-    
+    # ---------- inspect one sample ----------
     inspect_one_test_sample(
-    model=model,
-    test_loader=test_loader,
-    device=device,
-    idx_to_port_id=idx_to_port_id,
-    idx_to_gear=idx_to_gear,
-    idx_to_mmsi=idx_to_mmsi,
-    enc_feature_names=list(enc_var_dims.keys()),
-    top_k=5,
-)
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        idx_to_port_id=idx_to_port_id,
+        idx_to_gear=idx_to_gear,
+        idx_to_mmsi=idx_to_mmsi,
+        idx_to_season=idx_to_season,
+        idx_to_species=idx_to_species,
+        static_cat_features=static_cat_features,
+        enc_feature_names=list(enc_var_dims.keys()),
+        top_k=5,
+        model_type=args.model_type,
+    )
+
+    # def measure_inference_time(
+    #     model,
+    #     test_loader,
+    #     device,
+    #     model_type: str,
+    #     max_samples: int = 100,
+    # ):
+    #     model.eval()
+    #     times_ms = []
+
+    #     seen = 0
+    #     with torch.no_grad():
+    #         for batch in test_loader:
+    #             enc_vars, dec_vars, enc_lens, static_cont, static_cat, targets, _ = batch
+
+    #             enc_vars = {k: v.to(device) for k, v in enc_vars.items()}
+    #             dec_vars = {k: v.to(device) for k, v in dec_vars.items()}
+    #             enc_lens = enc_lens.to(device)
+    #             static_cont = static_cont.to(device)
+    #             static_cat = static_cat.to(device)
+
+    #             B = enc_lens.size(0)
+
+    #             for i in range(B):
+    #                 if seen >= max_samples:
+    #                     return times_ms
+
+    #                 # single-sample slicing
+    #                 enc_vars_i = {k: v[i:i+1] for k, v in enc_vars.items()}
+    #                 dec_vars_i = {k: v[i:i+1] for k, v in dec_vars.items()}
+    #                 enc_lens_i = enc_lens[i:i+1]
+    #                 static_cont_i = static_cont[i:i+1]
+    #                 static_cat_i = static_cat[i:i+1]
+
+    #                 start = time.perf_counter()
+
+    #                 if model_type == "tft":
+    #                     (logits, _), _ = model(
+    #                         enc_vars=enc_vars_i,
+    #                         dec_vars=dec_vars_i,
+    #                         enc_lengths=enc_lens_i,
+    #                         static_cont=static_cont_i,
+    #                         static_cat=static_cat_i,
+    #                     )
+    #                 else:
+    #                     x_seq = torch.cat(
+    #                         [
+    #                             enc_vars_i["lat"],
+    #                             enc_vars_i["lon"],
+    #                             enc_vars_i["sog"],
+    #                             enc_vars_i["cog"],
+    #                         ],
+    #                         dim=-1,
+    #                     )
+    #                     logits = model(
+    #                         x_seq=x_seq,
+    #                         static_cont=static_cont_i,
+    #                         static_cat=static_cat_i,
+    #                     )
+
+    #                 end = time.perf_counter()
+
+    #                 times_ms.append((end - start) * 1000.0)
+    #                 seen += 1
+
+    #     return times_ms
+
+
+    # times_ms = measure_inference_time(
+    #     model=model,
+    #     test_loader=test_loader,
+    #     device=device,
+    #     model_type=args.model_type,
+    #     max_samples=100,
+    # )
+
+    # if len(times_ms) > 0:
+    #     avg_time = sum(times_ms) / len(times_ms)
+    #     print(f"\n[Inference timing] Average inference time per sample: {avg_time:.3f} ms")
+
+    #     plt.figure(figsize=(8, 4))
+    #     plt.plot(times_ms, marker="o", linestyle="-", alpha=0.7)
+    #     plt.xlabel("Sample index")
+    #     plt.ylabel("Inference time (ms)")
+    #     plt.title(f"Inference time per sample ({args.model_type}, n={len(times_ms)})")
+    #     plt.grid(True)
+    #     plt.tight_layout()
+    #     plt.show()
+    # else:
+    #     print("[Inference timing] No samples measured.")
+
+    
+        # ---------- sweep inference accuracy vs hidden-last-hours ----------
+    if args.sweep_hide_hours:
+        import time
+        import matplotlib.pyplot as plt
+
+        print("\n[SWEEP] Evaluating accuracy vs hide_last_hours on TEST set...")
+
+        sweep_hours = np.arange(
+            args.sweep_hide_start,
+            args.sweep_hide_end + 1e-9,
+            args.sweep_hide_step,
+            dtype=float,
+        )
+
+        sweep_acc = []
+        sweep_loss = []
+
+        for h in sweep_hours:
+            # convert hours -> number of AIS points to hide
+            points_per_hour = int(60 / AIS_STEP_MINUTES)  # 12 for 5-min data
+            hide_last_n_points_sweep = int(round(h * points_per_hour))
+
+            # build a fresh TEST dataset with same IDs, same mappings, different hide length
+            test_dataset_sweep = VoyagePortDataset(
+                ais_df=ais_df,
+                voyages_df=voyages_df,
+                vessels_df=vessels_df,
+                encoder_length=args.encoder_length,
+                port_id_to_idx=port_id_to_idx,
+                gear_to_idx=gear_to_idx,
+                mmsi_to_idx=mmsi_to_idx,
+                season_to_idx=season_to_idx,
+                species_to_idx=species_to_idx,
+                static_cont_features=static_cont_features,
+                static_cat_features=static_cat_features,
+                hide_last_n_points=hide_last_n_points_sweep,
+                voyage_ids=test_ids,
+                window_mode=args.encoder_window_mode,
+                name=f"test_sweep_hide_{h:.1f}h",
+            )
+
+            test_loader_sweep = DataLoader(
+                test_dataset_sweep,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=collate_batch,
+            )
+
+            # evaluate
+            t0 = time.perf_counter()
+            loss_h, acc_h = evaluate_model(model, test_loader_sweep, device, args.model_type)
+            dt = (time.perf_counter() - t0)
+
+            sweep_loss.append(loss_h)
+            sweep_acc.append(acc_h)
+
+            print(f"  hide_last_hours={h:.1f} -> acc={acc_h:.4f}, loss={loss_h:.4f} (eval_time={dt:.2f}s)")
+
+        # plot accuracy vs hours
+        plt.figure()
+        plt.plot(sweep_hours, sweep_acc, marker="o")
+        plt.xlabel("Hidden last hours (hours)")
+        plt.ylabel("Test accuracy")
+        plt.title(f"Accuracy vs hidden-last-hours (model={args.model_type})")
+        plt.grid(True)
+
+        out_path = os.path.join(args.data_dir, f"sweep_acc_vs_hidehours3_{args.model_type}.png")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+
+        print(f"[SWEEP] Saved plot to: {out_path}")
 
 
 if __name__ == "__main__":
