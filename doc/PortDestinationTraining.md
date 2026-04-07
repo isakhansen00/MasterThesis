@@ -36,17 +36,17 @@ python src/model/trainer.py --data-dir training_data --years 2016 2017 2018 2019
 A typical full run looks like:
 
 ```bash
-python src/model/trainer.py \
-  --data-dir output_dca80 \
-  --years 2016 2017 2018 2019 2020 2022 2023 \
-  --encoder-length 64 \
-  --encoder-window-mode tail \
-  --batch-size 64 \
-  --epochs 30 \
-  --model-type tft \
-  --train-random-hide \
-  --train-hide-min-hours 1 \
-  --train-hide-max-hours 7 \
+python src/model/trainer.py
+  --data-dir output_dca80
+  --years 2016 2017 2018 2019 2020 2022 2023
+  --encoder-length 64
+  --encoder-window-mode tail
+  --batch-size 64
+  --epochs 30
+  --model-type tft
+  --train-random-hide
+  --train-hide-min-hours 1
+  --train-hide-max-hours 7
   --hide-last-hours 3
 ```
 
