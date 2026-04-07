@@ -7,7 +7,7 @@ The training script expects all processed data to be placed in a single folder, 
 ```text
 project_root/
 ├── src/model/trainer.py
-├── output_dca80/
+├── training_data/
 │   ├── ais_points_2016.csv
 │   ├── voyages_2016.csv
 │   ├── vessels_2016.csv
@@ -30,7 +30,7 @@ Catch files are optional. If they are missing, the model will still run, but som
 All experiments are run from the project root. At minimum, you only need to specify the data directory and years:
 
 ```bash
-python src/model/trainer.py --data-dir output_dca80 --years 2016 2017 2018 2019 2020 2022 2023
+python src/model/trainer.py --data-dir training_data --years 2016 2017 2018 2019 2020 2022 2023
 ```
 
 A typical full run looks like:
@@ -87,7 +87,7 @@ Standard destination port classification:
 --eta-multitask
 ```
 
-Adds ETA prediction as an auxiliary task. ETA is **not used as an input feature**.
+Adds ETA prediction as an auxiliary task..
 
 ---
 
@@ -100,7 +100,7 @@ Adds ETA prediction as an auxiliary task. ETA is **not used as an input feature*
 - First trains an ETA model  
 - Then trains the port model independently  
 
-ETA is evaluated separately and **not used as input to the port model**.
+ETA is evaluated separately.
 
 ---
 
