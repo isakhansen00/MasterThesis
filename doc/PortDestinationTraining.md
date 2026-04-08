@@ -1,6 +1,6 @@
 # Installation
 
-Install the required packages using pip install -r requirements.txt
+Install the required packages using pip install -r requirements.txt (make sure you have a virtual environment enabled)
 
 If you want cuda support for pytorch you need to install pytorch using
 
