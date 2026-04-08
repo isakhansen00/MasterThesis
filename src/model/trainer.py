@@ -55,7 +55,6 @@ MASTER_STATIC_CONT_FEATURES = [
     "total_catch_kg",
     "catch_num_species",
     "catch_entropy",
-    "obs_frac",  # <-- fraction observed after hide; removable via --remove-statics obs_frac
 ]
 
 MASTER_STATIC_CAT_FEATURES = [
@@ -1010,7 +1009,7 @@ def main():
     parser.add_argument(
         "--hide-last-hours",
         type=float,
-        default=0.0,
+        default=3.0,
         help="Fixed hide horizon for VAL/TEST (and TRAIN too if --train-random-hide is off).",
     )
 

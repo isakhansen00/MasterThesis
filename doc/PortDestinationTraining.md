@@ -30,7 +30,7 @@ Catch files are optional. If they are missing, the model will still run, but som
 All experiments are run from the project root. At minimum, you only need to specify the data directory and years:
 
 ```bash
-python src/model/trainer.py --data-dir training_data --years 2016 2017 2018 2019 2020 2022 2023
+python src/model/trainer.py --data-dir training_data --hide-last-hours 3 --years 2016 2017 2018 2019 2020 2022 2023
 ```
 
 A typical full run looks like:
@@ -48,6 +48,7 @@ python src/model/trainer.py
   --train-hide-min-hours 1
   --train-hide-max-hours 7
   --hide-last-hours 3
+  --sweep-hide-hours
 ```
 
 ---
