@@ -35,8 +35,8 @@ import matplotlib.pyplot as plt
 
 # Assumes these exist in your project
 from model import TFTClassifier
-from transformer import ModelB_TransformerWithStatic
-from LSTMandStatics import ModelA_BiLSTMWithStatic
+# from transformer import ModelB_TransformerWithStatic
+# from LSTMandStatics import ModelA_BiLSTMWithStatic
 
 
 # ---------- constants ----------
@@ -1038,7 +1038,7 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=["tft", "bilstm", "transformer"],
+        choices=["tft"],
         default="tft",
         help="Which architecture to train.",
     )
@@ -1325,33 +1325,33 @@ def main():
                 eta_quantiles=eta_qs,
             ).to(device)
 
-    elif args.model_type == "bilstm":
-        model = ModelA_BiLSTMWithStatic(
-            ts_input_dim=4,
-            static_cont_dim=len(static_cont_features),
-            static_cat_cardinalities=static_cat_cardinalities,
-            num_classes=num_ports,
-            hidden_size=64,
-            num_layers=1,
-            dropout=0.1,
-            static_emb_dim=16,
-        ).to(device)
+    # elif args.model_type == "bilstm":
+    #     model = ModelA_BiLSTMWithStatic(
+    #         ts_input_dim=4,
+    #         static_cont_dim=len(static_cont_features),
+    #         static_cat_cardinalities=static_cat_cardinalities,
+    #         num_classes=num_ports,
+    #         hidden_size=64,
+    #         num_layers=1,
+    #         dropout=0.1,
+    #         static_emb_dim=16,
+    #     ).to(device)
 
-    elif args.model_type == "transformer":
-        model = ModelB_TransformerWithStatic(
-            ts_input_dim=4,
-            static_cont_dim=len(static_cont_features),
-            static_cat_cardinalities=static_cat_cardinalities,
-            num_classes=num_ports,
-            d_model=64,
-            static_emb_dim=16,
-            n_heads=4,
-            num_layers=2,
-            dim_feedforward=128,
-            dropout=0.1,
-        ).to(device)
-    else:
-        raise ValueError(f"Unknown model_type: {args.model_type}")
+    # elif args.model_type == "transformer":
+    #     model = ModelB_TransformerWithStatic(
+    #         ts_input_dim=4,
+    #         static_cont_dim=len(static_cont_features),
+    #         static_cat_cardinalities=static_cat_cardinalities,
+    #         num_classes=num_ports,
+    #         d_model=64,
+    #         static_emb_dim=16,
+    #         n_heads=4,
+    #         num_layers=2,
+    #         dim_feedforward=128,
+    #         dropout=0.1,
+    #     ).to(device)
+    # else:
+    #     raise ValueError(f"Unknown model_type: {args.model_type}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
