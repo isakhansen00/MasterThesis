@@ -23,6 +23,7 @@ Adds:
 """
 
 import os
+import json
 import argparse
 from typing import List, Dict, Tuple, Optional
 
@@ -1485,6 +1486,60 @@ def main():
             eta_target_log1p=args.eta_target_log1p,
         )
         print(f"[TEST ETA] MAE_minutes={test_eta_mae_min:.2f}")
+
+    # ---------- save best checkpoint ----------
+    ckpt_dir = os.path.join("checkpoints", args.model_type)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    ckpt_path = os.path.join(ckpt_dir, "best_model.pt")
+    ckpt_payload = {
+        "model_state_dict": model.state_dict(),
+        "model_type": args.model_type,
+        "num_classes": num_ports,
+        "encoder_length": args.encoder_length,
+        "port_id_to_idx": port_id_to_idx,
+        "gear_to_idx": gear_to_idx,
+        "mmsi_to_idx": mmsi_to_idx,
+        "season_to_idx": season_to_idx,
+        "species_to_idx": species_to_idx,
+        "static_cont_features": static_cont_features,
+        "static_cat_features": static_cat_features,
+        "static_cat_cardinalities": static_cat_cardinalities,
+        "val_acc": best_val_acc,
+        "test_acc": test_acc,
+        "test_loss": test_loss,
+        "args": vars(args),
+    }
+    if args.two_stage_eta_port and eta_model is not None:
+        ckpt_payload["eta_model_state_dict"] = eta_model.state_dict()
+    torch.save(ckpt_payload, ckpt_path)
+    print(f"[INFO] Saved best checkpoint to {ckpt_path}")
+
+    # also save a human-readable metadata summary
+    meta_path = os.path.join(ckpt_dir, "training_meta.json")
+    meta = {
+        "model_type": args.model_type,
+        "num_classes": num_ports,
+        "encoder_length": args.encoder_length,
+        "val_acc": round(best_val_acc, 5),
+        "test_acc": round(test_acc, 5),
+        "test_loss": round(test_loss, 5),
+        "years": args.years,
+        "data_dir": args.data_dir,
+        "static_cont_features": static_cont_features,
+        "static_cat_features": static_cat_features,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "seed": args.seed,
+        "split_strategy": args.split_strategy,
+        "hide_last_hours": args.hide_last_hours,
+        "train_random_hide": args.train_random_hide,
+        "eta_multitask": args.eta_multitask,
+        "two_stage_eta_port": args.two_stage_eta_port,
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[INFO] Saved training metadata to {meta_path}")
 
     # ---------- feature importance (TFT only) ----------
     if args.model_type == "tft":

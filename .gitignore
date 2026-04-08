@@ -75,6 +75,10 @@ docs/_build/
 .pybuilder/
 target/
 
+# Model checkpoints (large binary files)
+checkpoints/*.pt
+checkpoints/**/*.pt
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -205,3 +209,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
